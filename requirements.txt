@@ -1,0 +1,11 @@
+# 核心依赖
+langchain
+langchain-openai
+faiss-cpu
+PyPDF2
+numpy
+python-dotenv
+
+# 可选依赖（用于其他功能）
+pillow
+requests
