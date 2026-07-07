@@ -9,7 +9,7 @@ import os
 import openai
 from typing import Optional, Dict, Any, Generator
 
-from models.base_model import BaseModel
+from src.models.base_model import BaseModel
 
 
 class OpenAIModel(BaseModel):

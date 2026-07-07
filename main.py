@@ -1,68 +1,53 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-多功能文档问答与任务处理智能体 
-主入口文件
-"""
+from __future__ import annotations
 
-import os
-import sys
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv() -> bool:
+        return False
 
-# 加载环境变量
-load_dotenv()
-
-# 添加src目录到Python路径
-sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
-
-from agent.complexity_analyzer import ComplexityAnalyzer
-from agent.react_agent import ReactAgent
-from memory.short_term_memory import ShortTermMemory
-from memory.long_term_memory import LongTermMemory
-from models.model_manager import ModelManager
-from tools.tool_manager import ToolManager
-from rag.rag_system import RAGSystem
+from src.agent.complexity_analyzer import ComplexityAnalyzer
+from src.agent.react_agent import ReactAgent
+from src.memory.long_term_memory import LongTermMemory
+from src.memory.short_term_memory import ShortTermMemory
+from src.models.model_manager import ModelManager
+from src.rag.rag_system import RAGSystem
+from src.tools.tool_manager import ToolManager
 
 
-def main():
-    """主函数"""
-    print("=== 智能任务执行助手 ===")
-    print("正在初始化...")
-    
-    # 初始化各个模块
+def build_agent() -> ReactAgent:
     model_manager = ModelManager()
     short_term_memory = ShortTermMemory()
     long_term_memory = LongTermMemory()
     tool_manager = ToolManager()
     rag_system = RAGSystem(long_term_memory)
     complexity_analyzer = ComplexityAnalyzer(model_manager)
-    
-    # 初始化Agent调度层
-    agent = ReactAgent(
+
+    return ReactAgent(
         model_manager=model_manager,
         short_term_memory=short_term_memory,
         long_term_memory=long_term_memory,
         tool_manager=tool_manager,
         rag_system=rag_system,
-        complexity_analyzer=complexity_analyzer
+        complexity_analyzer=complexity_analyzer,
     )
-    
-    print("初始化完成！")
-    print("输入'退出'或'quit'结束对话")
-    print("\n请输入您的问题：")
-    
-    # 开始对话循环
+
+
+def main():
+    load_dotenv()
+    agent = build_agent()
+
+    print("=== Multifunction Agent ===")
+    print("Type 'quit' or 'exit' to end the session.")
+
     while True:
-        user_input = input("用户: ")
-        
-        if user_input.lower() in ['退出', 'quit', 'exit']:
-            print("再见！")
+        user_input = input("User: ").strip()
+        if user_input.lower() in {"quit", "exit", "退出"}:
+            print("Bye.")
             break
-        
-        print("\nAgent: ", end="")
-        response = agent.run(user_input)
-        print(response)
-        print()
+        if not user_input:
+            continue
+        print(f"Agent: {agent.run(user_input)}")
 
 
 if __name__ == "__main__":

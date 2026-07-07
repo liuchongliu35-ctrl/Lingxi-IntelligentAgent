@@ -1,11 +1,17 @@
-# 核心依赖
+# Runtime dependencies
+python-dotenv
+requests
+PyPDF2
+
+# Optional providers and retrieval backends
+openai
 langchain
 langchain-openai
+langchain-community
 faiss-cpu
-PyPDF2
 numpy
-python-dotenv
+jieba
+beautifulsoup4
 
-# 可选依赖（用于其他功能）
-pillow
-requests
+# Development and test dependencies
+pytest

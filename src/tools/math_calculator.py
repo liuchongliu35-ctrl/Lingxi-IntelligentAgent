@@ -1,105 +1,73 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-数学计算工具
-复杂公式运算、数据统计
-"""
+from __future__ import annotations
 
+import ast
 import math
+import operator
 import statistics
-from typing import List
+from typing import Iterable
 
 
 class MathCalculator:
-    """数学计算工具"""
-    
-    def run(self, expression: str = None, data: List[float] = None, operation: str = "calculate") -> str:
-        """执行数学计算
-        
-        Args:
-            expression: 数学表达式
-            data: 数据列表
-            operation: 操作类型 (calculate/statistics)
-            
-        Returns:
-            计算结果
-        """
+    """Safe calculator for basic arithmetic and statistics."""
+
+    _OPS = {
+        ast.Add: operator.add,
+        ast.Sub: operator.sub,
+        ast.Mult: operator.mul,
+        ast.Div: operator.truediv,
+        ast.Mod: operator.mod,
+        ast.Pow: operator.pow,
+        ast.USub: operator.neg,
+        ast.UAdd: operator.pos,
+    }
+
+    _NAMES = {
+        "pi": math.pi,
+        "e": math.e,
+        "sqrt": math.sqrt,
+        "sin": math.sin,
+        "cos": math.cos,
+        "tan": math.tan,
+        "log": math.log,
+    }
+
+    def run(self, expression: str | None = None, data: Iterable[float] | None = None, operation: str = "calculate") -> str:
         if operation == "calculate":
-            if expression:
-                return self._calculate_expression(expression)
-            else:
-                return "请提供数学表达式"
-        elif operation == "statistics":
-            if data:
-                return self._calculate_statistics(data)
-            else:
-                return "请提供数据列表"
-        else:
-            return f"不支持的操作类型: {operation}"
-    
-    def _calculate_expression(self, expression: str) -> str:
-        """计算数学表达式
-        
-        Args:
-            expression: 数学表达式
-            
-        Returns:
-            计算结果
-        """
-        try:
-            # 安全计算表达式
-            # 只允许基本的数学运算和函数
-            allowed_globals = {
-                "math": math,
-                "sin": math.sin,
-                "cos": math.cos,
-                "tan": math.tan,
-                "sqrt": math.sqrt,
-                "log": math.log,
-                "exp": math.exp,
-                "pi": math.pi,
-                "e": math.e
-            }
-            
-            result = eval(expression, allowed_globals)
-            return str(result)
-        except Exception as e:
-            return f"计算失败: {str(e)}"
-    
-    def _calculate_statistics(self, data: List[float]) -> str:
-        """计算数据统计
-        
-        Args:
-            data: 数据列表
-            
-        Returns:
-            统计结果
-        """
-        try:
-            # 转换数据类型
-            data = [float(x) for x in data]
-            
-            # 计算统计指标
-            mean = statistics.mean(data)
-            median = statistics.median(data)
-            stdev = statistics.stdev(data) if len(data) > 1 else 0
-            variance = statistics.variance(data) if len(data) > 1 else 0
-            minimum = min(data)
-            maximum = max(data)
-            sum_ = sum(data)
-            count = len(data)
-            
-            # 构建结果
-            result = f"统计结果：\n"
-            result += f"样本数: {count}\n"
-            result += f"总和: {sum_}\n"
-            result += f"平均值: {mean}\n"
-            result += f"中位数: {median}\n"
-            result += f"标准差: {stdev}\n"
-            result += f"方差: {variance}\n"
-            result += f"最小值: {minimum}\n"
-            result += f"最大值: {maximum}"
-            
-            return result
-        except Exception as e:
-            return f"统计计算失败: {str(e)}"
+            if not expression:
+                return "Please provide a math expression."
+            return str(self._eval_expression(expression))
+
+        if operation == "statistics":
+            if data is None:
+                return "Please provide data for statistics."
+            return self._statistics(data)
+
+        return f"Unsupported math operation: {operation}"
+
+    def _eval_expression(self, expression: str) -> float:
+        tree = ast.parse(expression.replace("×", "*"), mode="eval")
+        return float(self._eval_node(tree.body))
+
+    def _eval_node(self, node: ast.AST):
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return node.value
+        if isinstance(node, ast.BinOp) and type(node.op) in self._OPS:
+            return self._OPS[type(node.op)](self._eval_node(node.left), self._eval_node(node.right))
+        if isinstance(node, ast.UnaryOp) and type(node.op) in self._OPS:
+            return self._OPS[type(node.op)](self._eval_node(node.operand))
+        if isinstance(node, ast.Name) and node.id in self._NAMES:
+            return self._NAMES[node.id]
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in self._NAMES:
+            func = self._NAMES[node.func.id]
+            args = [self._eval_node(arg) for arg in node.args]
+            return func(*args)
+        raise ValueError("Unsupported expression.")
+
+    def _statistics(self, data: Iterable[float]) -> str:
+        values = [float(item) for item in data]
+        if not values:
+            return "Data is empty."
+        return (
+            f"count={len(values)}, sum={sum(values)}, mean={statistics.mean(values)}, "
+            f"median={statistics.median(values)}, min={min(values)}, max={max(values)}"
+        )

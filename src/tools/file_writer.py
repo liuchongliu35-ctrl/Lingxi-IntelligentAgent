@@ -1,42 +1,31 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-文件写入工具
-将内容写入文件
-"""
+from __future__ import annotations
 
-import os
+from pathlib import Path
+
+from src.core.config import get_settings
+from src.tools.base import ToolResult
 
 
 class FileWriter:
-    """文件写入工具"""
-    
-    def run(self, content: str, file_path: str, overwrite: bool = False) -> str:
-        """将内容写入文件
-        
-        Args:
-            content: 要写入的内容
-            file_path: 文件路径
-            overwrite: 是否覆盖现有文件
-            
-        Returns:
-            操作结果
-        """
-        try:
-            # 检查文件是否存在
-            if os.path.exists(file_path) and not overwrite:
-                return f"文件 {file_path} 已存在，请设置 overwrite=True 覆盖"
-            
-            # 确保目录存在
-            directory = os.path.dirname(file_path)
-            if directory and not os.path.exists(directory):
-                os.makedirs(directory)
-            
-            # 写入文件
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(content)
-            
-            return f"文件写入成功: {file_path}"
-            
-        except Exception as e:
-            return f"文件写入失败: {str(e)}"
+    """Write files inside the configured workspace only."""
+
+    def run(self, content: str, file_path: str, overwrite: bool = False) -> ToolResult:
+        settings = get_settings()
+        if not settings.enable_file_write:
+            return ToolResult.fail("File writing is disabled by configuration.", code="file_write_disabled")
+
+        root = settings.workspace_root.resolve()
+        target = (root / file_path).resolve() if not Path(file_path).is_absolute() else Path(file_path).resolve()
+
+        if root not in [target, *target.parents]:
+            return ToolResult.fail(f"Refusing to write outside workspace: {target}", code="outside_workspace")
+
+        if target.exists() and not overwrite:
+            return ToolResult.fail(
+                f"File already exists: {target}. Pass overwrite=True to replace it.",
+                code="file_exists",
+            )
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        return ToolResult.ok(data={"path": str(target)}, message=f"File written: {target}")

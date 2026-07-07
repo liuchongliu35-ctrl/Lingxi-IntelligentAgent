@@ -1,82 +1,32 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-文档解析工具
-读取本地TXT、MD、PDF文件内容
-"""
+from __future__ import annotations
 
-import os
-from typing import Optional
-
-import PyPDF2
+from pathlib import Path
 
 
 class DocumentParser:
-    """文档解析工具"""
-    
+    """Read local txt, md, and pdf files."""
+
     def run(self, file_path: str) -> str:
-        """解析文档
-        
-        Args:
-            file_path: 文件路径
-            
-        Returns:
-            文档内容
-        """
-        if not os.path.exists(file_path):
-            return f"文件 {file_path} 不存在"
-        
-        file_extension = os.path.splitext(file_path)[1].lower()
-        
+        path = Path(file_path).resolve()
+        if not path.exists():
+            return f"File does not exist: {path}"
+
+        suffix = path.suffix.lower()
+        if suffix in {".txt", ".md"}:
+            return path.read_text(encoding="utf-8", errors="ignore")
+        if suffix == ".pdf":
+            return self._parse_pdf(path)
+        return f"Unsupported document type: {suffix}"
+
+    def _parse_pdf(self, path: Path) -> str:
         try:
-            if file_extension == ".txt":
-                return self._parse_txt(file_path)
-            elif file_extension == ".md":
-                return self._parse_md(file_path)
-            elif file_extension == ".pdf":
-                return self._parse_pdf(file_path)
-            else:
-                return f"不支持的文件类型: {file_extension}"
-        except Exception as e:
-            return f"解析文件失败: {str(e)}"
-    
-    def _parse_txt(self, file_path: str) -> str:
-        """解析TXT文件
-        
-        Args:
-            file_path: 文件路径
-            
-        Returns:
-            文件内容
-        """
-        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-            return f.read()
-    
-    def _parse_md(self, file_path: str) -> str:
-        """解析MD文件
-        
-        Args:
-            file_path: 文件路径
-            
-        Returns:
-            文件内容
-        """
-        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-            return f.read()
-    
-    def _parse_pdf(self, file_path: str) -> str:
-        """解析PDF文件
-        
-        Args:
-            file_path: 文件路径
-            
-        Returns:
-            文件内容
-        """
-        content = ""
-        with open(file_path, "rb") as f:
-            reader = PyPDF2.PdfReader(f)
-            for page_num in range(len(reader.pages)):
-                page = reader.pages[page_num]
-                content += page.extract_text()
-        return content
+            import PyPDF2
+        except ImportError:
+            return "PyPDF2 is not installed."
+
+        content: list[str] = []
+        with path.open("rb") as handle:
+            reader = PyPDF2.PdfReader(handle)
+            for page in reader.pages:
+                content.append(page.extract_text() or "")
+        return "\n".join(content).strip()
