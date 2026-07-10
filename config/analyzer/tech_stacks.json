@@ -1,0 +1,11 @@
+{
+  "python": ["python", "py", "fastapi", "django", "flask", "pytest", "unittest", "numpy", "pandas"],
+  "java": ["java", "spring", "springboot", "spring boot", "maven", "gradle", "junit"],
+  "cpp": ["c++", "cpp", "cmake", "gtest"],
+  "frontend": ["react", "vue", "nextjs", "next.js", "typescript", "javascript", "vite", "webpack"],
+  "backend": ["node", "express", "fastapi", "django", "flask", "spring", "nginx"],
+  "database": ["mysql", "postgresql", "postgres", "redis", "mongodb", "sqlite"],
+  "testing": ["pytest", "unittest", "playwright", "selenium", "junit", "gtest"],
+  "deployment": ["docker", "linux", "nginx", "kubernetes", "k8s", "ci/cd", "github actions"],
+  "deep_learning": ["pytorch", "pytouch", "tensorflow", "transformers", "transformer", "langchain", "faiss", "numpy", "pandas"]
+}

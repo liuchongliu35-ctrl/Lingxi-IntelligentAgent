@@ -1,0 +1,11 @@
+{
+  "domain_risks": {
+    "legal": ["合同", "协议", "诉讼", "律师函", "遗嘱", "赔偿", "法律"],
+    "medical": ["诊断", "治疗", "处方", "用药", "症状", "疾病", "医疗"],
+    "finance": ["投资", "股票", "基金", "贷款", "保险", "理财", "金融"],
+    "privacy": ["身份证", "密码", "银行卡", "手机号", "验证码", "隐私"]
+  },
+  "confirm_intents": ["delete_file", "execute_code"],
+  "block_keywords": ["删除系统目录", "格式化硬盘", "rm -rf /", "del /s c:\\", "shutdown", "format c:", "system32"],
+  "sensitive_paths": ["C:\\Windows", "C:\\Program Files", "C:\\Program Files (x86)", "/etc", "/usr", "/bin", "/var"]
+}

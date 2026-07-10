@@ -1,0 +1,78 @@
+**需要继续确认的问题**
+1. 第 9 题你没有回答：复杂度评分是否严格按 `复杂度判定.md` 的七维权重实现？  
+我建议答案是：严格按七维模型做 V1，但阈值和权重配置化。
+回答：严格按七维模型做 V1，但阈值和权重配置化。
+
+2. 你的核心意图集合是否接受我扩展成下面这类？
+```text
+calculate
+search
+summarize
+translate
+write
+analyze
+plan
+read_file
+write_file
+execute_code
+extract
+compare
+recommend
+chat
+classify
+convert_format
+organize_files
+list_files
+find_files
+rename_file
+copy_file
+move_file
+delete_file
+create_project
+design_project
+debug_code
+run_test
+deploy_project
+generate_report
+```
+回答：这些核心意图可以，但是这只是系统固定的可以识别的，如果用户输入的意图还有其他的也需要进行提取和规划进行解决
+
+
+3. 文件操作类意图里，哪些允许默认执行，哪些必须二次确认？  
+例如 `delete_file`、`move_file`、`overwrite_file`、`execute_code` 我建议必须确认或受配置控制。
+回答：overwrite_file和move_file可以默认执行，可以修改文件和创建文件或者移动文件，但是delete_file和execute_code执行删除文件和执行命令或者代码需要向用户确认是否执行
+
+4. Analyzer 是否要区分“用户想要结果”和“用户想要执行动作”？  
+例如“告诉我怎么删除文件”和“帮我删除这个文件”是不同风险等级。
+回答：需要识别，又是些时候用户只是想要一个文字的指导或者回答，不需要智能体帮忙完成某件事情，所以可以模仿trae和codex这样的智能体Agent设计两种模式，一种solo模式全程自动完成用户提出的意图需求（除非用户强调了不需要agent做而是自己做），另外一种就是chat模式不帮用户完成而是给出完成步骤或者问题的答案（代码）
+
+5. 参数缺失时，是由 Analyzer 只输出 `missing_parameters`，还是也直接生成 `clarification_questions`？  
+我建议 Analyzer 同时输出，Planner/Executor 直接使用。
+回答：Analyzer 同时输出，Planner/Executor 直接使用。
+
+6. LLM 生成新意图后，你希望怎么处理？  
+选项 A：临时作为 `unknown_custom_intent`，只本轮使用。  
+选项 B：记录到日志，后续人工加入意图库。  
+选项 C：自动加入意图库。  
+我建议 B，不建议 C。
+回答：这个可以配置，开启配置就可以自动加入意图库，不开启的话就自动记录到日志，人工加入
+
+7. 工具缺失时，Analyzer 输出到什么粒度？  
+例如只输出 `missing_tools=["excel_parser"]`，还是输出“两个备选执行方案 + 分别缺少哪些工具”？  
+你的回答倾向后者，我建议 V1 先做结构字段，展示文案后续 UI 再做。
+回答：V1先做结构字段吧，V2在做界面展示
+
+8. 对项目工程类任务，Analyzer 是否需要识别技术栈？  
+例如 Python、React、Node、FastAPI、Docker、数据库、测试框架等。  
+我建议需要，因为这会影响 Planner 和工具选择。
+回答：需要
+
+9. 对 Office 文件，V1 需要支持哪些格式作为一等公民？  
+我建议至少：`txt/md/pdf/docx/xlsx/csv/json`。  
+`pptx` 是否也要 V1 支持？
+回答：pptx在V1暂时不考虑，txt/md/pdf/docx/xlsx/csv/json这些格式V1需要可以支持
+
+10. 日志/过程展示里，是否允许展示 Analyzer 的内部判断细节？  
+例如意图分数、复杂度分、风险标记。  
+我建议开发模式显示完整，普通用户模式只显示简化过程。
+回答：开发模式显示，ui页面用户使用的时候就不需要显示了，这里显示的东西更倾向于思考和agent正在做的事情（比如调用工具和调用结果，还有修改和执行代码项目等）

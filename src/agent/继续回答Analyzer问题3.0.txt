@@ -1,0 +1,151 @@
+**最后需要确认的问题**
+1. `solo/chat` 全局模式开关放在哪里？  
+建议放 `.env` 和运行时配置里：
+```env
+AGENT_MODE=solo
+```
+后续 UI 再提供切换按钮。
+回答：可以
+
+2. 单次输入覆盖模式时，是否只对当前这一轮生效？  
+建议只对当前轮生效，不修改全局模式。
+回答：按照你的建议来
+解释：“单次输入覆盖模式只对当前轮生效”的意思是：
+假设全局模式是：
+AGENT_MODE=solo
+也就是默认 Agent 会主动帮你完成任务。
+但用户某一轮输入：
+只告诉我怎么做，不要执行
+那么这一轮 Analyzer 会临时把模式判定为 chat，只给步骤，不执行工具。
+下一轮如果用户没有再说“不执行”，模式会恢复全局默认 solo。
+反过来也一样。如果全局是 chat，但用户说：
+直接帮我完成
+那这一轮临时走 solo，下一轮恢复全局 chat。
+所以它的价值是：全局模式控制默认行为，单轮输入可以临时覆盖，但不改变系统默认设置。
+
+
+3. `pending_intents` 存在哪里？  
+建议 V1 存 JSON 文件：
+```text
+storage/analyzer/pending_intents.json
+```
+后续再做管理界面。
+回答：可以，后续再对意图库做管理，后续是需要对意图库做持久化储存的
+
+4. 新意图进入 `pending_intents` 的条件怎么定？  
+我建议：
+```text
+LLM 提取出非内置意图
+且置信度 >= 0.65
+且不是明显闲聊
+```
+如果低于阈值，只记录普通日志，不进入 pending。
+回答：这个阈值设计可以
+
+5. 是否允许 `pending_intents` 合并相似意图？  
+例如 `make_report`、`generate_report`、`write_report`。  
+建议 V1 先不自动合并，只记录 `normalized_name` 和 `raw_name`。
+回答：V1先不做这么复杂吧，先不自动合并，只记录 `normalized_name` 和 `raw_name`。
+
+6. Analyzer 日志保存在哪里？  
+建议：
+```text
+logs/analyzer.log
+```
+如果你不想先做日志文件，也可以 V1 先输出结构化字段，日志系统后面做。
+回答：日志文件需要V1需要保存，日志管理系统后续V2再做
+
+7. 对话概要导出保存在哪里？  
+建议：
+```text
+storage/sessions/{session_id}/summary.md
+```
+回答：可以保存到这里
+
+8. 对话概要由哪个模块生成？  
+建议不是 Analyzer 生成，而是后续 `SessionManager` 或 `MemoryManager` 生成。Analyzer 只输出当前任务阶段和结构化状态。
+回答：ui界面设置一个弹窗或者在命令行交互（V1主要是命令行交互，不做ui）里面创建新对话时自动显示是否导出上一个对话吧，这个就使用SessionManager完成吧，MemoryManager最好还是管好一个对话Session的记忆
+
+9. 局部修改文件 V1 是否先只识别意图，不真正执行精确 patch？  
+我建议：Analyzer V1 识别 `edit_mode=partial_edit`，Planner/Executor 后续再实现精确 patch。
+回答：这个问题是什么意思我不太懂
+解释：就是说“帮我把 app.py 里的登录函数加一个异常处理”和“帮我把 app.py 里的登录函数加一个异常处理”两种不同的表达任务复杂度也不一样，所以这里需要再不同层做处理
+再次回答：V1的Analyzer 只负责识别：edit_mode = "full_overwrite" | "partial_edit"
+也就是说 Analyzer 只判断这是“整文件覆盖”还是“局部修改”。
+真正怎么精确定位代码行、怎么生成 patch、怎么应用修改，交给后续 Planner/Executor 做。
+
+10. 技术栈识别 V1 是否按固定词表实现？  
+建议固定词表包括：
+```text
+python, fastapi, django, flask, node, express, react, vue, nextjs,
+typescript, javascript, mysql, postgresql, redis, docker, linux,
+pytest, unittest, playwright, selenium, nginx
+```
+回答：可以，可以在拓展几个，固定词表尽量能够覆盖python，java，C++的前后端技术栈吧还有pytouch、numpy、langchain、transformer等等这样的深度学习技术栈
+
+11. Analyzer 是否要输出 `confidence_level` 的文字等级？  
+例如：
+```text
+high / medium / low
+```
+建议需要，比分数更适合日志和 UI。
+回答：需要，主要是日志多打印一些东西的话调试起来也比较方便
+
+12. Analyzer 是否要支持“拒绝执行”状态？  
+例如用户要求删除系统目录、执行危险命令。  
+建议输出：
+```text
+action_policy = allow | confirm | block
+```
+回答：需要，像这危险的在开头的Analyzer层就需要提示危险和拒绝
+
+13. 如果用户意图超过 4 个，是否直接截断前 4 个，还是提示任务太大？  
+建议：取前 4 个，同时提示“已优先处理主要任务，其他任务可后续继续”。
+回答：按你的建议来
+
+14. Analyzer 输出是否要保留 `raw_analysis_trace`？  
+这不是给用户看的，是开发调试用。  
+建议 V1 保留，后续日志用。
+回答：按你的建议来
+
+15. 是否要把 Analyzer 的配置独立成一个 JSON？  
+建议需要：
+```text
+config/analyzer_config.json
+```
+里面放意图阈值、复杂度权重、模式、最大意图数、风险词表等。
+回答：这些配置后续规模是否会变大，如果规模变大的话仅仅使用json来管理的话是否会变的麻烦？
+解决方案：
+所以建议 V1 不做数据库，但也不要只用一个巨大的 JSON。更好的方式是：
+config/analyzer/
+  analyzer_config.json
+  intents.json
+  intent_keywords.json
+  risk_rules.json
+  complexity_weights.json
+  tech_stacks.json
+  tool_mapping.json
+这样还是 JSON，没有额外依赖，但每个文件职责清楚。
+建议拆分如下：
+analyzer_config.json
+放全局配置：
+{
+  "agent_mode": "solo",
+  "max_intents": 4,
+  "intent_score_threshold": 50,
+  "pending_intent_threshold": 0.65,
+  "allow_auto_pending_intents": true
+}
+intents.json
+放系统内置意图定义。
+intent_keywords.json
+放关键词匹配词表。
+risk_rules.json
+放高风险规则、危险操作规则。
+complexity_weights.json
+放七维复杂度权重和阈值。
+tech_stacks.json
+放技术栈词表。
+tool_mapping.json
+放意图到工具的映射关系。
+这个方案对 V1 足够轻量，后续 V2 如果需要管理界面或数据库，也很容易迁移。

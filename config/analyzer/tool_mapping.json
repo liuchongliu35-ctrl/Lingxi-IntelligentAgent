@@ -1,0 +1,11 @@
+{
+  "calculate": ["math_calculator"],
+  "search": ["search_tool"],
+  "summarize": ["text_processor"],
+  "translate": ["translator"],
+  "read_file": ["document_parser"],
+  "write_file": ["file_writer"],
+  "execute_code": ["code_executor"],
+  "extract": ["text_processor"],
+  "generate_report": ["text_processor", "file_writer"]
+}

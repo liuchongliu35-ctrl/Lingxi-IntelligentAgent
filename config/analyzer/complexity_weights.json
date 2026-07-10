@@ -1,0 +1,16 @@
+{
+  "weights": {
+    "uncertainty": 3.0,
+    "steps": 2.0,
+    "domain_risk": 1.8,
+    "tools": 1.5,
+    "information": 1.5,
+    "data_processing": 1.2,
+    "creativity": 1.0
+  },
+  "thresholds": {
+    "simple_max": 10,
+    "medium_max": 30
+  },
+  "risk_bonus": 10
+}

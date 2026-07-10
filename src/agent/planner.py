@@ -49,7 +49,7 @@ class Planner:
         if intent == "calculate":
             tool_name = "math_calculator"
             args = {"expression": task.parameters.get("expression", user_input)}
-        elif intent == "read" and task.parameters.get("file"):
+        elif intent in {"read", "read_file"} and task.parameters.get("file"):
             tool_name = "document_parser"
             args = {"file_path": task.parameters["file"]}
         elif intent == "translate":
@@ -87,3 +87,4 @@ class Planner:
                 ),
             ],
         )
+

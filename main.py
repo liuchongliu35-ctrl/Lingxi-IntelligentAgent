@@ -21,7 +21,7 @@ def build_agent() -> ReactAgent:
     long_term_memory = LongTermMemory()
     tool_manager = ToolManager()
     rag_system = RAGSystem(long_term_memory)
-    complexity_analyzer = ComplexityAnalyzer(model_manager)
+    complexity_analyzer = ComplexityAnalyzer(model_manager, tool_manager=tool_manager)
 
     return ReactAgent(
         model_manager=model_manager,
@@ -52,3 +52,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

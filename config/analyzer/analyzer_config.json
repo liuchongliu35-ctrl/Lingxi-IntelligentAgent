@@ -1,0 +1,14 @@
+{
+  "agent_mode": "solo",
+  "max_intents": 4,
+  "intent_score_threshold": 50,
+  "pending_intent_threshold": 0.65,
+  "allow_auto_pending_intents": false,
+  "log_path": "logs/analyzer.log",
+  "pending_intents_path": "storage/analyzer/pending_intents.json",
+  "supported_file_types": ["txt", "md", "pdf", "docx", "xlsx", "csv", "json"],
+  "confidence_thresholds": {
+    "high": 0.85,
+    "medium": 0.6
+  }
+}
