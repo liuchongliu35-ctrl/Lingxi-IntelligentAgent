@@ -26,6 +26,9 @@ class FileInfo:
     file_path: str | None = None
     file_type: str | None = None
     operation_type: str | None = None
+    source_path: str | None = None
+    target_path: str | None = None
+    all_paths: List[str] = field(default_factory=list)
     supported: bool = False
 
 
@@ -96,6 +99,32 @@ class ComplexityAnalyzer:
         "deploy": ["部署", "上线", "发布", "deploy"],
         "document": ["文档", "说明", "readme", "document"],
     }
+    LANGUAGE_KEYWORDS = {
+        "zh": ["中文", "汉语", "简体中文", "chinese", "zh"],
+        "en": ["英文", "英语", "english", "en"],
+        "ja": ["日文", "日语", "japanese", "ja"],
+        "ko": ["韩文", "韩语", "korean", "ko"],
+        "fr": ["法文", "法语", "french", "fr"],
+        "de": ["德文", "德语", "german", "de"],
+        "es": ["西班牙文", "西班牙语", "spanish", "es"],
+    }
+    OUTPUT_FORMAT_KEYWORDS = {
+        "md": ["markdown", "md"],
+        "json": ["json"],
+        "txt": ["txt", "文本"],
+        "csv": ["csv"],
+        "xlsx": ["xlsx", "excel"],
+        "docx": ["docx", "word"],
+        "pdf": ["pdf"],
+    }
+    TIME_RANGE_KEYWORDS = {
+        "latest": ["最新", "最近", "近期", "latest", "recent"],
+        "today": ["今天", "今日", "today"],
+        "yesterday": ["昨天", "yesterday"],
+        "this_week": ["本周", "这周", "this week"],
+        "this_month": ["本月", "这个月", "this month"],
+        "this_year": ["今年", "本年", "this year"],
+    }
 
     def __init__(
         self,
@@ -133,6 +162,12 @@ class ComplexityAnalyzer:
             result.parameters["file"] = result.file_info["file_path"]
             result.parameters["file_path"] = result.file_info["file_path"]
             result.parameters["file_type"] = result.file_info.get("file_type")
+        if result.file_info.get("source_path"):
+            result.parameters["source_path"] = result.file_info["source_path"]
+        if result.file_info.get("target_path"):
+            result.parameters["target_path"] = result.file_info["target_path"]
+        if result.file_info.get("all_paths"):
+            result.parameters["file_paths"] = result.file_info["all_paths"]
         result.edit_mode = self._detect_edit_mode(cleaned, result.intent_sequence)
         result.entities = self._extract_entities(result.parameters)
         result.missing_parameters = self._detect_missing_parameters(result.intent_sequence, result.parameters)
@@ -194,6 +229,10 @@ class ComplexityAnalyzer:
                         probability = prediction.probabilities.get(intent, 0.0)
                         scored[intent] = IntentScore(intent, probability * 100, prediction.source, [])
 
+        if not scored and self.model_manager is not None:
+            for item in self._llm_fallback_intents(text, result):
+                scored[item.name] = item
+
         if not scored:
             scored["chat"] = IntentScore("chat", 50.0, "fallback", [])
 
@@ -218,14 +257,206 @@ class ComplexityAnalyzer:
         if re.fullmatch(r"[a-z0-9_ .+/#-]+", key):
             return bool(re.search(rf"(?<![a-z0-9_]){re.escape(key)}(?![a-z0-9_])", lowered))
         return key in lowered
+
     def _classifier_predict(self, text: str) -> IntentPrediction:
         tokens = list(text.lower())
         if self._has_multi_marker(text):
             return self.intent_classifier.predict_multi(text, tokens)
         return self.intent_classifier.predict_single(text, tokens)
 
+    def _llm_fallback_intents(self, text: str, result: AnalysisResult) -> List[IntentScore]:
+        prompt = (
+            "Extract user intents as strict JSON only.\n"
+            f"Known intents: {', '.join(self.config.intents)}\n"
+            "Return format: {\"intents\":[{\"name\":\"...\",\"confidence\":0.0,\"reason\":\"...\"}]}\n"
+            "Use known intents when possible. If a real intent is outside the known list, return a concise snake_case name.\n"
+            "Use chat only for obvious casual conversation.\n"
+            f"User input: {text}"
+        )
+        try:
+            raw_response = self.model_manager.generate(prompt)
+        except Exception as exc:
+            result.raw_analysis_trace.append(f"llm fallback failed: {exc}")
+            return []
+
+        parsed_items = self._parse_llm_intent_response(raw_response)
+        if not parsed_items:
+            result.raw_analysis_trace.append("llm fallback returned no parseable intents")
+            return []
+
+        scores: List[IntentScore] = []
+        for item in parsed_items:
+            raw_name = str(item.get("name", "")).strip()
+            normalized_name = self._normalize_intent_name(raw_name)
+            confidence = float(item.get("confidence", 0.0) or 0.0)
+            if not normalized_name or normalized_name in {"unknown", "none"}:
+                continue
+            if normalized_name not in self.config.intents:
+                if confidence >= self.config.pending_intent_threshold and normalized_name != "chat":
+                    self._record_pending_intent(raw_name, normalized_name, confidence, text, result)
+                scores.append(IntentScore(normalized_name, confidence * 100, "llm", []))
+            else:
+                scores.append(IntentScore(normalized_name, confidence * 100, "llm", []))
+        if scores:
+            result.raw_analysis_trace.append("llm fallback supplied intents")
+        return scores
+
+    def _parse_llm_intent_response(self, raw_response: Any) -> List[Dict[str, Any]]:
+        if isinstance(raw_response, dict):
+            data = raw_response
+        else:
+            text = str(raw_response or "").strip()
+            match = re.search(r"\{.*\}", text, re.S)
+            if not match:
+                return []
+            try:
+                data = json.loads(match.group(0))
+            except json.JSONDecodeError:
+                return []
+        intents = data.get("intents", [])
+        return intents if isinstance(intents, list) else []
+
+    def _normalize_intent_name(self, name: str) -> str:
+        normalized = name.strip().lower()
+        normalized = re.sub(r"[\s\-]+", "_", normalized)
+        normalized = re.sub(r"[^a-z0-9_]+", "", normalized)
+        return normalized
+
+    def _record_pending_intent(
+        self,
+        raw_name: str,
+        normalized_name: str,
+        confidence: float,
+        user_input: str,
+        result: AnalysisResult,
+    ) -> None:
+        path = self.config.pending_intents_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        now = datetime.now().isoformat(timespec="seconds")
+        payload: List[Dict[str, Any]] = []
+        if path.exists():
+            try:
+                with path.open("r", encoding="utf-8-sig") as file:
+                    loaded = json.load(file)
+                if isinstance(loaded, list):
+                    payload = loaded
+            except (json.JSONDecodeError, OSError):
+                result.raw_analysis_trace.append("pending intents file unreadable; rebuilding list")
+
+        existing = None
+        for item in payload:
+            if item.get("normalized_name") == normalized_name:
+                existing = item
+                break
+        if existing is None:
+            payload.append(
+                {
+                    "raw_name": raw_name,
+                    "normalized_name": normalized_name,
+                    "confidence": round(confidence, 4),
+                    "source": "llm",
+                    "status": "pending",
+                    "first_seen": now,
+                    "last_seen": now,
+                    "occurrence_count": 1,
+                    "examples": [user_input],
+                }
+            )
+        else:
+            existing["last_seen"] = now
+            existing["occurrence_count"] = int(existing.get("occurrence_count", 0)) + 1
+            existing["confidence"] = max(float(existing.get("confidence", 0.0)), round(confidence, 4))
+            examples = existing.setdefault("examples", [])
+            if user_input not in examples:
+                examples.append(user_input)
+            existing["examples"] = examples[-5:]
+
+        with path.open("w", encoding="utf-8") as file:
+            json.dump(payload, file, ensure_ascii=False, indent=2)
+        result.raw_analysis_trace.append(f"pending intent recorded: {normalized_name}")
+
     def _has_multi_marker(self, text: str) -> bool:
         return any(marker in text for marker in self.MULTI_INTENT_MARKERS)
+
+    def _detect_output_format(self, text: str) -> str | None:
+        lowered = text.lower()
+        for output_format, keywords in self.OUTPUT_FORMAT_KEYWORDS.items():
+            if any(keyword.lower() in lowered for keyword in keywords):
+                return output_format
+        return None
+
+    def _detect_languages(self, text: str) -> tuple[str | None, str | None]:
+        lowered = text.lower()
+        source_language: str | None = None
+        target_language: str | None = None
+        for language, keywords in self.LANGUAGE_KEYWORDS.items():
+            for keyword in keywords:
+                key = keyword.lower()
+                if re.search(rf"(?:从|把|将)\s*{re.escape(key)}", lowered):
+                    source_language = language
+                if re.search(rf"(?:成|到|为|to|into)\s*{re.escape(key)}", lowered):
+                    target_language = language
+                if key in lowered and target_language is None and any(marker in lowered for marker in ["翻译", "译成", "翻成", "translate"]):
+                    target_language = language
+        return source_language, target_language
+
+    def _detect_time_range(self, text: str) -> str | None:
+        lowered = text.lower()
+        year_match = re.search(r"(20\d{2}|19\d{2})\s*年?", text)
+        if year_match:
+            return year_match.group(1)
+        for time_range, keywords in self.TIME_RANGE_KEYWORDS.items():
+            if any(keyword.lower() in lowered for keyword in keywords):
+                return time_range
+        return None
+
+    def _extract_topic(self, text: str) -> str | None:
+        patterns = [
+            r"(?:关于|有关|围绕|针对)\s*([^，。；;,.]+)",
+            r"(?:搜索|查询|检索|查找|找资料)\s*([^，。；;,.]+)",
+            r"(?:分析|总结|概括|推荐|写|生成|撰写|起草)\s*([^，。；;,.]+)",
+            r"(?:about|on|regarding)\s+([^,.;]+)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text, re.I)
+            if not match:
+                continue
+            topic = self._strip_topic_noise(match.group(1))
+            if topic:
+                return topic
+        return None
+
+    def _strip_topic_noise(self, value: str) -> str:
+        topic = value.strip(" ：:，。；;,.")
+        topic = re.sub(r"(?:并|然后|同时|以及|再).*$", "", topic).strip()
+        topic = re.sub(r"(?:的)?(?:最新|最近|近期)?\s*\d*\s*(?:篇|个|份|条)?(?:论文|资料|文章)$", "", topic).strip()
+        topic = re.sub(r"(?:的)?(?:资料|内容|重点|报告|文档|文件)$", "", topic).strip()
+        return topic
+
+    def _extract_inline_content(self, text: str) -> str | None:
+        match = re.search(r"[：:]\s*(.+)$", text)
+        if match:
+            content = match.group(1).strip()
+            return content or None
+        quote_match = re.search(r"[“\"'](.+?)[”\"']", text)
+        if quote_match:
+            return quote_match.group(1).strip()
+        return None
+
+    def _extract_target_path(self, text: str, operation_type: str | None) -> str | None:
+        if operation_type not in {"move", "copy", "rename", "write"}:
+            return None
+        patterns = [
+            r"(?:到|至|为|成|保存到|输出到|重命名为|改名为)\s*([^\s'\"，。；;]+)",
+            r"\b(?:to|as|into)\s+([^\s'\"，。；;]+)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text, re.I)
+            if match:
+                candidate = match.group(1).strip()
+                if candidate:
+                    return candidate
+        return None
 
     def _extract_parameters(self, text: str) -> Dict[str, Any]:
         params: Dict[str, Any] = {}
@@ -233,21 +464,37 @@ class ComplexityAnalyzer:
         if numbers:
             params["numbers"] = [float(n) if "." in n else int(n) for n in numbers]
             expression = re.search(r"[\d\s+\-*/().×x]+", text)
-            if expression:
+            if expression and re.search(r"\d\s*(?:[+\-*/×x])\s*\d", expression.group(0)):
                 params["expression"] = expression.group(0).replace("x", "*").replace("×", "*").strip()
         count_match = re.search(r"(\d+)\s*(?:个|篇|份|条|次)", text)
         if count_match:
             params["count"] = int(count_match.group(1))
-        if "markdown" in text.lower() or "md" in text.lower():
-            params["output_format"] = "md"
-        elif "json" in text.lower():
-            params["output_format"] = "json"
+        output_format = self._detect_output_format(text)
+        if output_format:
+            params["output_format"] = output_format
+        source_language, target_language = self._detect_languages(text)
+        if source_language:
+            params["source_language"] = source_language
+        if target_language:
+            params["target_language"] = target_language
+        time_range = self._detect_time_range(text)
+        if time_range:
+            params["time_range"] = time_range
+        topic = self._extract_topic(text)
+        if topic:
+            params["topic"] = topic
+        content = self._extract_inline_content(text)
+        if content:
+            params["content"] = content
         return params
 
     def _extract_file_info(self, text: str, intents: List[str]) -> FileInfo:
         extensions = "|".join(re.escape(ext) for ext in self.config.supported_file_types) or "txt|md|pdf|docx|xlsx|csv|json"
-        match = re.search(rf"[^\s'\"，。；;]+\.(?:{extensions})", text, re.I)
-        file_path = match.group(0) if match else None
+        extension_paths = re.findall(rf"[^\s'\"，。；;]+?\.(?:{extensions})", text, re.I)
+        windows_paths = re.findall(r"[a-zA-Z]:\\[^\s'\"，。；;]+", text)
+        unix_paths = re.findall(r"(?<![\w.])(?:/[\w .@%+=:,~#-]+)+", text)
+        paths = list(dict.fromkeys(extension_paths + windows_paths + unix_paths))
+        file_path = paths[0] if paths else None
         file_type = Path(file_path).suffix.lower().lstrip(".") if file_path else None
         operation_type = None
         if "delete_file" in intents:
@@ -262,10 +509,15 @@ class ComplexityAnalyzer:
             operation_type = "write"
         elif "read_file" in intents:
             operation_type = "read"
+        source_path = paths[0] if paths else None
+        target_path = paths[1] if len(paths) > 1 else self._extract_target_path(text, operation_type)
         return FileInfo(
             file_path=file_path,
             file_type=file_type,
             operation_type=operation_type,
+            source_path=source_path,
+            target_path=target_path,
+            all_paths=paths,
             supported=bool(file_type and file_type in self.config.supported_file_types),
         )
 
@@ -290,14 +542,29 @@ class ComplexityAnalyzer:
         missing: List[str] = []
         if "calculate" in intents and not parameters.get("expression"):
             missing.append("expression")
-        if any(intent in intents for intent in ["read_file", "write_file", "delete_file", "move_file", "copy_file", "rename_file"]):
+        if any(intent in intents for intent in ["read_file", "delete_file"]):
             if not parameters.get("file_path"):
                 missing.append("file_path")
+        if "write_file" in intents:
+            if not parameters.get("file_path"):
+                missing.append("file_path")
+            if not parameters.get("content") and not parameters.get("topic"):
+                missing.append("content")
+        if any(intent in intents for intent in ["move_file", "copy_file", "rename_file"]):
+            if not parameters.get("source_path"):
+                missing.append("source_path")
+            if not parameters.get("target_path"):
+                missing.append("target_path")
         if "translate" in intents and "target_language" not in parameters:
             missing.append("target_language")
-        if "search" in intents and len(parameters.get("numbers", [])) == 0 and len(self._clean(parameters.get("topic", ""))) == 0:
-            # Keep search usable when the text itself is the topic; no missing field by default.
-            pass
+        if "search" in intents and not self._clean(parameters.get("topic", "")):
+            missing.append("topic")
+        if any(intent in intents for intent in ["summarize", "extract", "analyze", "compare"]):
+            if not any(parameters.get(name) for name in ["topic", "content", "file_path"]):
+                missing.append("content_or_file")
+        if any(intent in intents for intent in ["write", "generate_report"]):
+            if not any(parameters.get(name) for name in ["topic", "content"]):
+                missing.append("topic")
         return list(dict.fromkeys(missing))
 
     def _build_clarification_questions(self, missing: List[str], intents: List[str]) -> List[str]:
@@ -309,6 +576,16 @@ class ComplexityAnalyzer:
                 questions.append("请补充要计算的完整表达式。")
             elif field_name == "target_language":
                 questions.append("请说明要翻译成哪种语言。")
+            elif field_name == "topic":
+                questions.append("请补充要处理的主题或对象。")
+            elif field_name == "content":
+                questions.append("请补充要写入文件的内容或生成要求。")
+            elif field_name == "content_or_file":
+                questions.append("请补充要处理的文本内容或文件路径。")
+            elif field_name == "source_path":
+                questions.append("请补充源文件路径。")
+            elif field_name == "target_path":
+                questions.append("请补充目标文件路径或新文件名。")
             else:
                 questions.append(f"请补充 {field_name}。")
         if not intents or intents == ["chat"]:
