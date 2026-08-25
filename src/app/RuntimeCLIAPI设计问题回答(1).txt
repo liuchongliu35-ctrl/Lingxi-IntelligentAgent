@@ -1,0 +1,799 @@
+# Runtime / CLI / API 设计问题回答（1）
+
+本文档用于第一轮确认 Runtime / CLI / API 层的设计问题。请直接在每个“你的回答：”后面填写答案。
+
+说明：
+- 这些问题不是考试题，目的是把 Runtime / CLI / API 层的职责边界、对内串联方式、对外交互方式、会话与事件契约、错误返回、流式能力、命令结构和验收方式定清楚。
+- Runtime / CLI / API 层必须服务当前已经完成的 Memory V1、Analyzer V1、Planner V1、ReActExecutor V1、Models V1 和 Tools V1，不重新设计这些层的主链路。
+- 当前整体主链路已经是：
+
+```text
+用户输入
+  -> Runtime / CLI / API
+  -> SessionManager / Memory
+  -> ReactAgent
+      -> Analyzer
+      -> Planner
+      -> ReActExecutor
+          Reasoning -> Decision -> Tool / Model / User / Control -> Observation -> Checker
+      -> OutputFeedback
+  -> Memory 更新
+  -> 用户反馈
+```
+
+更准确地说：
+
+```text
+CLI / API:
+  对外接收输入、传输结果、承载交互形式。
+
+Runtime:
+  对内装配依赖、编排一轮运行、管理 session/run、串联 Memory / ReactAgent / OutputFeedback。
+
+Memory:
+  负责 session、消息、事件、上下文、摘要和回放。
+
+ReactAgent:
+  负责 Analyzer / Planner / ReActExecutor 的核心编排。
+```
+
+Runtime 不是新的推理层，也不是 Analyzer、Planner 或 ReActExecutor 的替代品，而是把这些层真正装配起来并对外提供稳定运行边界的应用编排层。
+
+当前项目分层总览：
+
+```text
+已完成或作为当前核心主链路：
+  ReactAgent 编排层
+  Analyzer 层
+  Planner 层
+  ReActExecutor 层
+  输出反馈处理器
+
+基础服务层：
+  Models 层
+  Tools 层
+
+后续支撑与增强层：
+  Runtime / CLI / API 层
+  Memory 层增强
+  RAG / 知识库层增强
+  安全与权限层统一
+  配置、日志、观测与端到端验收工程
+```
+
+本轮回答后如果仍有不明确的点，后续可以继续生成 `RuntimeCLIAPI设计问题回答(2).txt`。
+
+---
+
+## 0. 先确认总定位
+
+### 问题 0：你是否同意把 `src/app/` 作为 Runtime / CLI / API 的共同父目录？
+
+通俗解释：
+这一层不是单独的“模型能力层”或“工具能力层”，而是 Agent 的“应用入口与运行编排层”。把 `runtime / cli / api` 放在同一个父目录下，可以明确它们是同一层的不同适配形态。
+
+建议：
+采用 `src/app/` 作为共同父目录，里面再分：
+
+```text
+src/app/
+  runtime/
+  cli/
+  api/
+```
+
+理由：
+- `Runtime` 是这一层的核心编排对象。
+- `CLI` 和 `API` 都只是 Runtime 的不同对外适配器。
+- 这个命名比 `entry` 更准确，比 `service` 更不容易和业务服务层混淆。
+
+为什么要问：
+这会影响代码组织方式、未来 import 路径、测试目录结构和后续文档命名。
+
+你的回答：采取你的建议
+
+---
+
+## 1. Runtime 在整体 Agent 里的定位
+
+### 问题 1：你是否同意 Runtime 的正式职责是“应用编排 + 依赖装配 + 会话生命周期 + 对外结果归一化”？
+
+通俗解释：
+Runtime 应该做的是把各层真正连起来，而不是重新做理解、规划或工具决策。
+
+建议：
+Runtime 负责以下事情：
+
+```text
+1. 接收 session_id / user_input / mode / stream 等运行参数。
+2. 创建或加载 Session。
+3. 创建本轮 AgentRun。
+4. 构建 context_text / 短期记忆。
+5. 调用 ReactAgent。
+6. 透传 event_callback 给执行链。
+7. 接收 ExecutionResult / OutputFeedback。
+8. 保存 assistant message、事件和 run 状态。
+9. 统一处理异常、blocked、waiting_user、request_replan 等状态。
+10. 返回 CLI / API 可消费的结构化结果。
+```
+
+Runtime 不负责：
+
+```text
+不重新做 Analyzer 理解。
+不重新做 Planner 规划。
+不自己执行工具。
+不直接操作 SQL。
+不重复保存消息。
+```
+
+为什么要问：
+这决定 Runtime 是“真应用外壳”，还是只是一个很薄的函数包装。
+
+你的回答：同意，采取你的建议
+
+---
+
+### 问题 2：你是否同意 Runtime 需要对外暴露一组稳定的运行入口，而不是只写一个 `run()`？
+
+通俗解释：
+正式使用时，除了“一次普通对话”，通常还会有流式、恢复、健康检查、会话查询和 timeline 查询。
+
+建议：
+Runtime 第一版建议至少预留这些入口：
+
+```text
+run(session_id, user_input, ...)
+run_stream(session_id, user_input, ...)
+resume(...)
+get_session(session_id)
+get_timeline(session_id)
+list_sessions()
+health()
+```
+
+如果后续需要更完整的交互，再增加：
+
+```text
+cancel_run(...)
+delete_session(...)
+export_session(...)
+```
+
+为什么要问：
+Runtime 接口一旦定死，CLI 和 API 就会直接依赖它，后面改动成本会明显上升。
+
+你的回答：同意，采取你的建议，至少保留你建议的入口，确保第一版的agent可以正常跑
+
+---
+
+### 问题 3：你是否同意 Runtime 只做“依赖装配”，不把业务逻辑塞到各层内部？
+
+通俗解释：
+依赖装配的意思是：创建对象、注入对象、接线、配置生命周期，而不是在 Runtime 里重新实现分析、规划、执行。
+
+建议：
+Runtime 应负责组装这些对象：
+
+```text
+ModelManager
+ToolManager
+SessionManager
+ContextBuilder
+RuntimeMemoryAdapter
+Analyzer
+Planner
+ReActExecutor
+ReactAgent
+OutputFeedbackProcessor
+```
+
+Runtime 通过装配把它们串起来，而不是把这些对象的内部职责合并掉。
+
+为什么要问：
+如果 Runtime 过度膨胀，后面会变成“第二个 ReactAgent”。
+
+你的回答：采取你的建议
+
+---
+
+## 2. Session / Run / Message / Event 契约
+
+### 问题 4：session_id 应该由谁生成，用户是否可以显式传入？
+
+通俗解释：
+session_id 是会话边界。它可以由系统自动生成，也可以由 CLI/API 用户指定，用于恢复同一会话。
+
+建议：
+- 默认允许 Runtime 自动生成。
+- CLI/API 允许用户显式传入。
+- 如果用户传入，就先做合法性校验，再交给 Memory。
+- 不同入口必须共用同一套 session_id 规则。
+
+为什么要问：
+这会影响多轮对话恢复、会话列表、timeline 回放和 API 的路径设计。
+
+你的回答：采取你的建议，创建新会话那就是系统生成session_id ，如果用户从会话列表选择某一个会话那就是传递这个会话的id，然后就可以看到和之前一模一样的对话历史，这块需要配合sqlite实现，储存会话以及历史记录，这块Memory层应该有相关的实现和对外的接入函数
+
+---
+
+### 问题 5：run_id、message_id、event_id、summary_id 应该由 Runtime 还是 Memory 生成？
+
+通俗解释：
+这些 ID 负责把一次运行中的消息、事件和摘要串起来。
+
+建议：
+优先由 Memory 层统一生成和管理：
+
+```text
+Runtime
+  -> 请求创建 turn / run
+Memory / SessionManager
+  -> 分配 message_id / run_id / event_id / summary_id
+```
+
+Runtime 只拿结果，不自己拼数据库主键。
+
+为什么要问：
+统一 ID 生成有利于幂等、回放和故障恢复。
+
+你的回答：采取你的建议，优先由Memory层统一生成管理，对外可以传递这些参数，这样外部就可以使用，这些是记录到数据库中的，memory负责管理
+
+---
+
+### 问题 6：正式 Runtime 模式下，消息写入责任是否完全归 Runtime / Memory，而不是 ReactAgent 自己？
+
+通俗解释：
+这是你之前已经确认过的重要边界，但现在需要在 Runtime 设计里正式钉死。
+
+建议：
+正式 Runtime 模式使用：
+
+```python
+manage_memory=False
+```
+
+含义是：
+- Runtime / SessionManager 写 user message。
+- Runtime / SessionManager 写 assistant message。
+- Runtime / SessionManager 保存可见事件和 run 状态。
+- ReactAgent 只消费 `context_text`，不再重复写消息。
+
+同时保留旧兼容模式：
+- 直接调用 `ReactAgent.run()` 时仍可保留旧行为，方便原型和历史测试。
+
+为什么要问：
+如果 Runtime 和 ReactAgent 同时写消息，会重复落库、重复显示、重复触发摘要。
+
+你的回答：采取你的建议，写消息这件事情应该只由一个模块负责，不能重复
+
+---
+
+### 问题 7：Runtime 是否要统一接管 ReActExecutor 的事件回调，并决定哪些事件对用户可见？
+
+通俗解释：
+ReActExecutor 会产生很多事件，其中有些是用户应看到的，有些只是内部调试信号。
+
+建议：
+Runtime 应该：
+
+```text
+1. 接收 ReActExecutor 的 event_callback。
+2. 默认只持久化 visible_to_user=True 的事件。
+3. 将可见事件转发给 CLI/API。
+4. 内部事件默认不进入普通 timeline。
+5. 调试模式再按需开放 include_internal。
+```
+
+为什么要问：
+这决定用户看到的过程反馈是什么，Memory timeline 怎么落库，以及 CLI/API 是否支持调试输出。
+
+你的回答：采取你的建议，Runtime 要统一接管 ReActExecutor 的事件回调
+
+---
+
+## 3. Runtime 与 ReactAgent / Memory / OutputFeedback 的边界
+
+### 问题 8：Runtime 返回给上层的主结果，应该更偏向 `ExecutionResult`、`OutputFeedback`，还是两者都返回？
+
+通俗解释：
+`ExecutionResult` 偏结构化，适合程序和测试；`OutputFeedback` 偏用户展示，适合 CLI/UI。
+
+建议：
+Runtime 第一版建议同时保留两类结果，但主返回结构要统一：
+
+```text
+RuntimeResult
+  - execution_result
+  - output_feedback
+  - session_state
+  - timeline
+  - persistence_warning
+  - error_code / error_message
+```
+
+这样：
+- CLI 可以直接拿 `output_feedback` 打印。
+- API 可以返回 `execution_result` + `timeline`。
+- 测试可以断言结构化字段。
+
+为什么要问：
+这会影响 Runtime 输出协议，也会影响 CLI 和 API 的展示逻辑。
+
+你的回答：采取你的建议，这两类都需要返回，这样上层可以灵活的进行处理
+
+---
+
+### 问题 9：Runtime 是否要自己生成用户可见文本，还是只负责把 ReactAgent / OutputFeedback 的结果转发出去？
+
+通俗解释：
+Runtime 有两种做法：
+- 一种是它自己拼最终回答文本。
+- 另一种是让 ReactAgent / OutputFeedback 产出，Runtime 只负责传递和落库。
+
+建议：
+Runtime 不要自己发明新的自然语言总结逻辑，优先使用：
+
+```text
+ReactAgent / ReActExecutor -> ExecutionResult
+OutputFeedbackProcessor -> OutputFeedback
+Runtime -> 负责传递、落库、返回
+```
+
+Runtime 只做必要的包装和错误补充。
+
+为什么要问：
+避免 Runtime 变成又一个“回答生成器”。
+
+你的回答：采取你的建议，Runtime 不做回答的拼接工作，这块ReactAgent 负责做
+
+---
+
+## 4. CLI 设计问题
+
+### 问题 10：CLI 你是否倾向于用 Typer，还是继续用标准库 `argparse`？
+
+通俗解释：
+两者都能做命令行，但体验不同。
+
+建议：
+- 如果你希望后续命令分组、参数提示、帮助信息和开发速度更舒服，推荐 `Typer`。
+- 如果你希望依赖尽量少、完全标准库，推荐 `argparse`。
+
+我的倾向建议：
+优先 `Typer`，因为它更适合后面会有多个子命令的应用型 CLI。
+
+为什么要问：
+这个选择会影响 CLI 的代码风格、帮助输出和后续扩展成本。
+
+你的回答：采取你的建议，就使用Typer
+
+---
+
+### 问题 11：CLI 第一版你希望支持哪些命令？
+
+通俗解释：
+CLI 不一定一上来就做全，最重要的是把常用的会话和运行入口打通。
+
+建议第一版最小命令集：
+
+```text
+agent chat
+agent chat --session-id <id>
+agent sessions
+agent session show <id>
+agent timeline <id>
+agent health
+```
+
+可选后续命令：
+
+```text
+agent resume
+agent config
+agent export
+agent delete-session
+```
+
+为什么要问：
+命令集太少不好用，太多会让第一版过重。
+
+你的回答：采取你的建议，反正至少可以支持正常的对话和切换会话
+
+---
+
+### 问题 12：CLI 的交互模式，你希望默认是“同步一问一答”，还是支持流式输出？
+
+通俗解释：
+同步模式就是用户发一句，等完整结果；流式模式就是边执行边显示过程事件。
+
+建议：
+第一版 CLI 最少支持同步输出，最好再支持流式：
+
+```text
+同步：
+  适合先把主链路跑通。
+
+流式：
+  适合展示工具过程、执行进度和最终结果。
+```
+
+如果流式支持，建议 CLI 默认只显示可见事件，不暴露内部事件，除非显式加 `--debug`。
+
+为什么要问：
+这决定 CLI 的用户体验和 Runtime 的事件输出方式。
+
+你的回答：采取你的建议，我建议最好流式也一起实现，这样用户就可以边观察agent执行过程（任务完成过程，包括工具调用执行，思考，间歇式小节文字的一个过程）
+
+---
+
+### 问题 13：CLI 的输出内容，你希望更偏“人类可读文本”，还是“结构化 JSON + 人类文本双模式”？
+
+通俗解释：
+人类可读文本适合终端使用；JSON 适合脚本、调试和自动化。
+
+建议：
+CLI 建议两种模式都保留：
+
+```text
+默认模式:
+  人类可读文本
+
+--json:
+  输出结构化结果，方便脚本消费
+```
+
+为什么要问：
+后面如果要做自动化集成测试或脚本调用，JSON 模式非常有用。
+
+你的回答：采取你的建议
+
+---
+
+## 5. API 设计问题
+
+### 问题 14：API 你是否同意优先采用 FastAPI，而不是自己手写轻量 HTTP 框架？
+
+通俗解释：
+FastAPI 更适合 typed schema、自动文档、流式接口和后续扩展。
+
+建议：
+优先 FastAPI，原因：
+
+```text
+1. 请求/响应模型清晰。
+2. 自动 OpenAPI 文档方便。
+3. 对 session、run、timeline 这类资源型接口更自然。
+4. 以后做 SSE / WebSocket 也更顺。
+```
+
+如果你更想极简，也可以用标准库或轻量框架，但从你这个项目的复杂度来看，FastAPI 更稳。
+
+为什么要问：
+这会直接影响 API 层目录、依赖、测试和部署方式。
+
+你的回答：可以就使用fastapi做接口，采取你的建议
+
+---
+
+### 问题 15：API 第一版你希望暴露哪些核心路由？
+
+通俗解释：
+API 不是把所有内部对象都露出来，而是暴露“会话 + 运行 + 状态 + 回放”这些资源。
+
+建议第一版最小路由：
+
+```text
+POST /sessions
+GET /sessions/{session_id}
+GET /sessions
+POST /sessions/{session_id}/runs
+GET /sessions/{session_id}/timeline
+GET /health
+```
+
+可选路由：
+
+```text
+POST /sessions/{session_id}/resume
+POST /sessions/{session_id}/cancel
+DELETE /sessions/{session_id}
+GET /runs/{run_id}
+```
+
+为什么要问：
+API 资源粒度一旦定下来，后面前端或调用方的契约就会比较稳定。
+
+你的回答：采取你的建议，建议里面的可选路由也帮我实现
+
+---
+
+### 问题 16：API 你是否需要支持流式返回？如果支持，优先 SSE 还是 WebSocket？
+
+通俗解释：
+如果你想边执行边推送进度，可以考虑流式；如果只是最终结果，普通 REST 就够了。
+
+建议：
+- 第一版推荐优先 **SSE**，因为它更适合“单向推送执行事件”。
+- 如果未来需要双向交互、动态确认或更复杂前端控制，再考虑 WebSocket。
+- 如果短期只想最小可用，也可以先不做流式，先做普通 REST。
+
+为什么要问：
+流式会影响 Runtime 事件模型、API 连接管理和前端接入方式。
+
+你的回答：需要支持流式返回，干脆第一版就使用websocket吧，先实现基本工具，后续再慢慢优化
+
+---
+
+### 问题 17：API 返回结果，你希望以“统一 JSON 包装体”为主，还是按路由直接返回业务对象？
+
+通俗解释：
+统一包装体更适合错误码、状态码、trace 信息和前端统一处理。
+
+建议：
+API 更适合统一包装体，例如：
+
+```json
+{
+  "success": true,
+  "data": {...},
+  "error": null,
+  "code": null,
+  "trace_id": "...",
+  "session_id": "...",
+  "run_id": "..."
+}
+```
+
+为什么要问：
+这决定 API 的一致性和错误处理难度。
+
+你的回答：API需要有一个自己的Reault和结构化结果返回给调用端，可以将业务对象包装到Result中，这样可以统一去管理和处理
+
+---
+
+## 6. 运行时配置、错误和生命周期
+
+### 问题 18：Runtime 是否应当集中做依赖初始化，还是让每个入口自己各建一套对象？
+
+通俗解释：
+如果 CLI 和 API 各自创建一套对象，很容易出现 session、模型、日志和工具配置不一致。
+
+建议：
+Runtime 应该成为唯一装配中心：
+
+```text
+CLI / API
+  -> 调用同一套 Runtime factory
+  -> Runtime 内部创建或持有共享依赖
+```
+
+这样：
+- 会话管理一致。
+- 模型和工具配置一致。
+- 日志和观测一致。
+- 测试也更容易统一。
+
+为什么要问：
+这会决定未来代码是“各入口各写一套”，还是“共享一套 Runtime 内核”。
+
+你的回答：采取你的建议
+
+---
+
+### 问题 19：Runtime 的配置来源，你希望怎么分层？
+
+通俗解释：
+Runtime 这层通常会接触模型、工具、会话、日志、API 和 CLI 配置。
+
+建议：
+配置最好分成三类：
+
+```text
+1. Core 层配置
+   workspace、日志、运行环境、全局开关
+
+2. 各业务层配置
+   models、tools、memory、react_executor
+
+3. Runtime 层自身配置
+   默认入口模式、stream 开关、debug 开关、并发策略
+```
+
+Runtime 不建议把所有配置都塞自己身上。
+
+为什么要问：
+这会影响配置文件结构和后续维护成本。
+
+你的回答：采取你的建议
+
+---
+
+### 问题 20：Runtime 对错误的处理，你希望统一成什么样的对外语义？
+
+通俗解释：
+比如 session 不存在、参数错、模型错、工具错、被阻断、等待用户确认，这些状态需要有统一返回规则。
+
+建议：
+Runtime 对外建议统一区分：
+
+```text
+success
+failed
+blocked
+waiting_user
+request_replan
+interrupted
+```
+
+并把它们映射到：
+- CLI 退出码
+- API HTTP 状态码
+- 统一错误对象
+
+建议的基本映射：
+
+```text
+success -> 200 / exit 0
+waiting_user -> 202 / exit 0 或特定交互码
+blocked -> 403 / exit 2
+not_found -> 404 / exit 1
+validation_error -> 400 / exit 1
+internal_error -> 500 / exit 3
+```
+
+为什么要问：
+错误语义定不清，CLI/API 体验会非常乱。
+
+你的回答：采取你的建议，Runtime 这里统一一下错误处理方案以及向上层传递的统一化的结构，至于下面业务层返回什么样的错误，由Runtime 进行统一的处理和包装，除了建议的基本映射在设计的时候你可以再多思考一下是否还有其他的映射没有考虑到
+
+---
+
+## 7. 兼容、启动和验收
+
+### 问题 21：你希望如何处理当前 `main.py`？
+
+通俗解释：
+现在的 `main.py` 还是旧原型入口，后面有几种处理方式。
+
+建议：
+将 `main.py` 收敛为一个很薄的启动器：
+
+```python
+from src.app.cli import main
+
+if __name__ == "__main__":
+    main()
+```
+
+不要让 `main.py` 再承担依赖装配和业务编排。
+
+为什么要问：
+这样能避免入口逻辑和正式 Runtime 逻辑再次分叉。
+
+你的回答：采取你的建议，main当做一个很薄的启动器和系统入口，不负责真正的应用层和业务编排
+
+---
+
+### 问题 22：你是否希望 Runtime / CLI / API 第一阶段就把健康检查、session 查询和 timeline 回放做进去？
+
+通俗解释：
+这些不是“高级功能”，而是非常实用的基础运维能力。
+
+建议：
+第一阶段至少包含：
+
+```text
+health
+get_session
+get_timeline
+list_sessions
+```
+
+原因：
+- 有利于调试。
+- 有利于验收。
+- 有利于查看 Memory 是否真的串起来了。
+
+为什么要问：
+如果第一版不带这些能力，后面排查问题会很费劲。
+
+你的回答：采取你的建议，可以做进去
+
+---
+
+### 问题 23：Runtime / CLI / API 第一轮完成后，你希望以什么作为验收标准？
+
+通俗解释：
+这里不是单测成功就算完，而是要确认整个链路真的连通。
+
+建议验收标准：
+
+```text
+1. CLI 能发起一轮对话。
+2. API 能创建 session 并发起 run。
+3. Runtime 能串起 Memory / ReactAgent / OutputFeedback。
+4. 可见事件能正确进入 timeline。
+5. session 重启后能恢复。
+6. manage_memory=False 下不会重复写消息。
+7. blocked / waiting_user / request_replan 能正确返回。
+8. 最小端到端测试可以稳定通过。
+```
+
+为什么要问：
+这决定第一阶段开发结束时到底算不算真正闭环。
+
+你的回答：采取你的建议
+
+---
+
+## 8. 额外确认
+
+### 问题 24：如果 Runtime / CLI / API 第一版遇到跨层不一致，你是否同意优先调整 Runtime 适配，而不是大范围改 Analyzer / Planner / ReActExecutor / Tools？
+
+通俗解释：
+Runtime 的职责之一就是“适配现有层的契约”，所以遇到接不上的地方，通常应优先改 Runtime。
+
+建议：
+是。优先顺序建议如下：
+
+```text
+1. 先调整 Runtime 适配方式
+2. 再做少量兼容层
+3. 最后才考虑改内部层
+```
+
+为什么要问：
+这能避免新入口层倒逼已经完成的核心层大改。
+
+你的回答：同意，优先查看 Runtime / CLI / API是否可以去适配和调整，如果必须这样设计而其他层有不适配可以去修改其他层的相关代码来适配Runtime / CLI / API
+
+---
+
+### 问题 25：你是否希望 Runtime 层后续单独再拆一个“factory / bootstrap / contracts / errors / health”结构？
+
+通俗解释：
+如果 Runtime 只做一个很大的文件，后面会很难维护。
+
+建议：
+Runtime 最好内部再分：
+
+```text
+factory
+contracts
+errors
+health
+runtime core
+```
+
+这样 CLI / API 只依赖稳定接口，不直接碰装配细节。
+
+为什么要问：
+这会影响 Runtime 目录内部的工程化程度。
+
+你的回答：同意，Runtime 的逻辑和代码不能都塞到一个文件里面，需要根据分工明确区分，注意工程化的原则
+
+---
+
+## 9. 当前结论
+
+目前 Runtime / CLI / API 层最重要的不是先写代码，而是先确认：
+
+```text
+1. Runtime 的职责边界。
+2. CLI / API 是否共享同一套 Runtime。
+3. session / run / event 的归属。
+4. event callback 和可见性边界。
+5. CLI 与 API 各自的交互形态。
+6. FastAPI / Typer / argparse 的选择。
+7. 错误码、状态码、流式方式和验收标准。
+```
+
+如果这轮确认完，后续就可以直接进入：
+
+```text
+Runtime / CLI / API 架构设计
+-> 分阶段开发规划
+-> 代码实现
+-> 联调验收
+```

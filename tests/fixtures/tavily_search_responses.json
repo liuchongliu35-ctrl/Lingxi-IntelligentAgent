@@ -1,0 +1,31 @@
+{
+  "success": {
+    "query": "agent architecture",
+    "answer": "A concise summary from Tavily.",
+    "results": [
+      {
+        "title": "Agent Architecture Guide",
+        "url": "https://example.test/agent-architecture",
+        "content": "A structured result snippet.",
+        "score": 0.97,
+        "favicon": "https://example.test/favicon.ico",
+        "images": [
+          {
+            "url": "https://example.test/image.png"
+          }
+        ],
+        "raw_content": "Full raw page text that should be hidden by default."
+      }
+    ],
+    "response_time": 0.42,
+    "request_id": "req-123",
+    "usage": {
+      "query_tokens": 10,
+      "response_tokens": 20
+    }
+  },
+  "missing_results": {
+    "query": "agent architecture",
+    "answer": "A summary without results."
+  }
+}

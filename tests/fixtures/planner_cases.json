@@ -1,0 +1,499 @@
+[
+  {
+    "id": "micro_calculate",
+    "user_input": "calculate 2+3",
+    "task": {
+      "execution_strategy": "micro",
+      "task_type": "tool_operation",
+      "intent": ["calculate"],
+      "intent_sequence": ["calculate"],
+      "parameters": {"expression": "2+3"},
+      "available_tools": ["math_calculator"]
+    },
+    "expected": {
+      "mode": "micro",
+      "planning_strategy": "rule_template",
+      "plan_validation_status": "valid",
+      "can_execute": true,
+      "task_units_count": 1,
+      "step_count": 1,
+      "step_types": ["tool"],
+      "tool_names": ["math_calculator"],
+      "required_tools": ["math_calculator"]
+    }
+  },
+  {
+    "id": "micro_read_file",
+    "user_input": "read docs/readme.md",
+    "task": {
+      "execution_strategy": "micro",
+      "task_type": "document_understanding",
+      "intent": ["read_file"],
+      "intent_sequence": ["read_file"],
+      "parameters": {"file_path": "docs/readme.md", "file": "docs/readme.md"},
+      "available_tools": ["document_parser"]
+    },
+    "expected": {
+      "mode": "micro",
+      "planning_strategy": "rule_template",
+      "plan_validation_status": "valid",
+      "step_count": 1,
+      "step_types": ["tool"],
+      "tool_names": ["document_parser"],
+      "required_tools": ["document_parser"]
+    }
+  },
+  {
+    "id": "micro_translate",
+    "user_input": "translate hello to French",
+    "task": {
+      "execution_strategy": "micro",
+      "task_type": "tool_operation",
+      "intent": ["translate"],
+      "intent_sequence": ["translate"],
+      "parameters": {"content": "hello", "target_language": "fr"},
+      "available_tools": ["translator"]
+    },
+    "expected": {
+      "mode": "micro",
+      "planning_strategy": "rule_template",
+      "step_count": 1,
+      "step_types": ["tool"],
+      "tool_names": ["translator"]
+    }
+  },
+  {
+    "id": "search_summarize",
+    "user_input": "search agent planning and summarize",
+    "task": {
+      "execution_strategy": "meso",
+      "task_type": "research",
+      "intent": ["search", "summarize"],
+      "intent_sequence": ["search", "summarize"],
+      "parameters": {"topic": "agent planning"},
+      "available_tools": ["search_tool", "text_processor"]
+    },
+    "expected": {
+      "mode": "meso",
+      "planning_strategy": "rule_template",
+      "step_count": 2,
+      "step_types": ["tool", "tool"],
+      "tool_names": ["search_tool", "text_processor"],
+      "required_tools": ["search_tool", "text_processor"]
+    }
+  },
+  {
+    "id": "search_summarize_write_file",
+    "user_input": "search planner architecture, summarize, write notes",
+    "task": {
+      "execution_strategy": "meso",
+      "task_type": "research",
+      "intent": ["search", "summarize", "write_file"],
+      "intent_sequence": ["search", "summarize", "write_file"],
+      "parameters": {"topic": "planner architecture", "target_path": "notes/planner.md"},
+      "available_tools": ["search_tool", "text_processor", "file_writer"]
+    },
+    "expected": {
+      "mode": "meso",
+      "planning_strategy": "rule_template",
+      "step_count": 3,
+      "step_types": ["tool", "tool", "tool"],
+      "tool_names": ["search_tool", "text_processor", "file_writer"],
+      "required_tools": ["search_tool", "text_processor", "file_writer"],
+      "added_steps_contains": ["rule_template:search_summarize_write_file"]
+    }
+  },
+  {
+    "id": "read_file_summarize",
+    "user_input": "summarize docs/spec.md",
+    "task": {
+      "execution_strategy": "meso",
+      "task_type": "document_understanding",
+      "intent": ["read_file", "summarize"],
+      "intent_sequence": ["read_file", "summarize"],
+      "parameters": {"file_path": "docs/spec.md"},
+      "available_tools": ["document_parser", "text_processor"]
+    },
+    "expected": {
+      "planning_strategy": "rule_template",
+      "step_count": 2,
+      "step_types": ["tool", "tool"],
+      "tool_names": ["document_parser", "text_processor"]
+    }
+  },
+  {
+    "id": "read_extract_write_file",
+    "user_input": "extract key facts from docs/spec.md into out/facts.md",
+    "task": {
+      "execution_strategy": "meso",
+      "task_type": "document_understanding",
+      "intent": ["read_file", "extract", "write_file"],
+      "intent_sequence": ["read_file", "extract", "write_file"],
+      "parameters": {"file_path": "docs/spec.md", "target_path": "out/facts.md"},
+      "available_tools": ["document_parser", "text_processor", "file_writer"]
+    },
+    "expected": {
+      "planning_strategy": "rule_template",
+      "step_count": 3,
+      "step_types": ["tool", "tool", "tool"],
+      "tool_names": ["document_parser", "text_processor", "file_writer"]
+    }
+  },
+  {
+    "id": "translate_write_file",
+    "user_input": "translate hello to French and save it",
+    "task": {
+      "execution_strategy": "meso",
+      "task_type": "file_operation",
+      "intent": ["translate", "write_file"],
+      "intent_sequence": ["translate", "write_file"],
+      "parameters": {"content": "hello", "target_language": "fr", "target_path": "out/fr.txt"},
+      "available_tools": ["translator", "file_writer"]
+    },
+    "expected": {
+      "planning_strategy": "rule_template",
+      "step_count": 2,
+      "step_types": ["tool", "tool"],
+      "tool_names": ["translator", "file_writer"]
+    }
+  },
+  {
+    "id": "convert_format",
+    "user_input": "convert docs/source.md to out/source.txt",
+    "task": {
+      "execution_strategy": "meso",
+      "task_type": "file_operation",
+      "intent": ["convert_format"],
+      "intent_sequence": ["convert_format"],
+      "parameters": {"file_path": "docs/source.md", "file_type": "md", "target_format": "txt", "target_path": "out/source.txt"},
+      "available_tools": ["document_parser", "file_writer"]
+    },
+    "expected": {
+      "planning_strategy": "rule_template",
+      "step_count": 3,
+      "step_types": ["tool", "model", "tool"],
+      "tool_names": ["document_parser", null, "file_writer"]
+    }
+  },
+  {
+    "id": "multi_file_summarize",
+    "user_input": "summarize docs/a.md and docs/b.md",
+    "task": {
+      "execution_strategy": "meso",
+      "task_type": "document_understanding",
+      "intent": ["read_file", "summarize"],
+      "intent_sequence": ["read_file", "summarize"],
+      "parameters": {"file_paths": ["docs/a.md", "docs/b.md"]},
+      "available_tools": ["document_parser", "text_processor"]
+    },
+    "expected": {
+      "planning_strategy": "rule_template",
+      "task_units_count": 2,
+      "step_count": 4,
+      "step_types": ["tool", "tool", "tool", "tool"],
+      "tool_names": ["document_parser", "text_processor", "document_parser", "text_processor"]
+    }
+  },
+  {
+    "id": "software_debug_code",
+    "user_input": "debug src/app.py",
+    "task": {
+      "execution_strategy": "meso_advanced",
+      "task_type": "software_engineering",
+      "intent": ["debug_code"],
+      "intent_sequence": ["debug_code"],
+      "parameters": {"file_path": "src/app.py"},
+      "available_tools": []
+    },
+    "expected": {
+      "planning_strategy": "rule_template",
+      "step_count": 2,
+      "step_types": ["model", "respond"],
+      "tool_names": [null, null],
+      "added_steps_contains": ["rule_template:software_engineering_basic"]
+    }
+  },
+  {
+    "id": "unknown_intent_model_only",
+    "user_input": "do an unknown operation",
+    "task": {
+      "execution_strategy": "meso",
+      "task_type": "qa",
+      "tool_strategy": "model_only",
+      "intent": ["unknown_operation"],
+      "intent_sequence": ["unknown_operation"],
+      "parameters": {},
+      "available_tools": []
+    },
+    "expected": {
+      "mode": "meso",
+      "planning_strategy": "rule_template",
+      "step_count": 2,
+      "step_types": ["model", "respond"],
+      "tool_names": [null, null]
+    }
+  },
+  {
+    "id": "block_policy",
+    "user_input": "delete C:\\Windows\\System32",
+    "task": {
+      "execution_strategy": "meso",
+      "action_policy": "block",
+      "risk_flags": ["dangerous_command"],
+      "intent": ["delete_file"],
+      "intent_sequence": ["delete_file"],
+      "parameters": {},
+      "available_tools": []
+    },
+    "expected": {
+      "mode": "blocked",
+      "planning_strategy": "policy_rule",
+      "plan_validation_status": "not_required",
+      "can_execute": false,
+      "step_count": 1,
+      "step_types": ["block"],
+      "tool_names": [null]
+    }
+  },
+  {
+    "id": "clarify_missing_language",
+    "user_input": "translate hello",
+    "task": {
+      "execution_strategy": "macro",
+      "requires_clarification": true,
+      "missing_parameters": ["target_language"],
+      "clarification_questions": ["Which language should I translate to?"],
+      "intent": ["translate"],
+      "intent_sequence": ["translate"],
+      "parameters": {"content": "hello"},
+      "available_tools": ["translator"]
+    },
+    "expected": {
+      "mode": "clarify",
+      "planning_strategy": "policy_rule",
+      "plan_validation_status": "not_required",
+      "can_execute": false,
+      "step_count": 1,
+      "step_types": ["clarify"]
+    }
+  },
+  {
+    "id": "confirm_write_file",
+    "user_input": "overwrite report.md",
+    "task": {
+      "execution_strategy": "meso",
+      "action_policy": "confirm",
+      "requires_confirmation": true,
+      "confirmation_reason": "write_file",
+      "intent": ["write_file"],
+      "intent_sequence": ["write_file"],
+      "parameters": {"file_path": "report.md", "content": "new"},
+      "available_tools": ["file_writer"]
+    },
+    "expected": {
+      "mode": "confirm",
+      "planning_strategy": "policy_rule",
+      "plan_validation_status": "not_required",
+      "can_execute": false,
+      "step_count": 1,
+      "step_types": ["confirm"]
+    }
+  },
+  {
+    "id": "missing_tools",
+    "user_input": "analyze an Excel file",
+    "task": {
+      "execution_strategy": "meso",
+      "tool_strategy": "blocked_missing_tools",
+      "missing_tools": ["excel_parser"],
+      "intent": ["read_file", "summarize"],
+      "intent_sequence": ["read_file", "summarize"],
+      "parameters": {"file_path": "data.xlsx"},
+      "available_tools": []
+    },
+    "expected": {
+      "mode": "missing_tools",
+      "planning_strategy": "policy_rule",
+      "plan_validation_status": "not_required",
+      "can_execute": false,
+      "missing_tools": ["excel_parser"],
+      "step_count": 1,
+      "step_types": ["respond"]
+    }
+  },
+  {
+    "id": "chat_mode",
+    "user_input": "tell me how to delete a file, do not execute",
+    "task": {
+      "mode": "chat",
+      "execution_strategy": "meso",
+      "intent": ["delete_file", "chat"],
+      "intent_sequence": ["delete_file", "chat"],
+      "parameters": {},
+      "available_tools": []
+    },
+    "expected": {
+      "mode": "chat",
+      "planning_strategy": "policy_rule",
+      "plan_validation_status": "not_required",
+      "can_execute": true,
+      "step_count": 1,
+      "step_types": ["respond"],
+      "tool_names": [null]
+    }
+  },
+  {
+    "id": "llm_unavailable_fallback",
+    "user_input": "plan an unusual workflow",
+    "task": {
+      "execution_strategy": "meso_advanced",
+      "task_type": "software_engineering",
+      "tool_strategy": "model_only",
+      "intent": ["create_project"],
+      "intent_sequence": ["create_project"],
+      "parameters": {"topic": "custom workflow"},
+      "available_tools": []
+    },
+    "model_response": "not json",
+    "expected": {
+      "mode": "meso_advanced",
+      "planning_strategy": "fallback_model_only",
+      "step_count": 2,
+      "step_types": ["model", "respond"],
+      "notes_contains": ["no_parseable_json_plan"]
+    }
+  },
+  {
+    "id": "llm_reorders_intents",
+    "user_input": "write then search requirements, but plan safely",
+    "task": {
+      "execution_strategy": "meso_advanced",
+      "task_type": "content_generation",
+      "tool_strategy": "model_only",
+      "intent": ["write", "search"],
+      "intent_sequence": ["write", "search"],
+      "parameters": {"topic": "requirements"},
+      "available_tools": []
+    },
+    "model_response": {
+      "mode": "meso_advanced",
+      "plan_validation_notes": ["LLM reordered Analyzer intents to search before write."],
+      "added_steps_reason": ["Added research before writing."],
+      "task_units": [{"id": "task_1", "title": "Research and write", "step_ids": ["step_1", "step_2"]}],
+      "steps": [
+        {"id": "step_1", "task_id": "task_1", "step_type": "model", "description": "Research requirements.", "expected_output": "Research notes", "output_key": "research_notes", "allow_model_reasoning": true},
+        {"id": "step_2", "task_id": "task_1", "step_type": "respond", "description": "Write final response.", "depends_on": ["step_1"], "input_from": ["step_1"], "expected_output": "Final draft", "allow_model_reasoning": true}
+      ]
+    },
+    "expected": {
+      "mode": "meso_advanced",
+      "planning_strategy": "llm_planner",
+      "step_count": 2,
+      "step_types": ["model", "respond"],
+      "notes_contains": ["reordered Analyzer intents"],
+      "added_steps_contains": ["Added research before writing."]
+    }
+  },
+  {
+    "id": "llm_shell_candidate_invalid",
+    "user_input": "use shell as fallback",
+    "task": {
+      "execution_strategy": "meso_advanced",
+      "task_type": "software_engineering",
+      "tool_strategy": "model_only",
+      "intent": ["create_project"],
+      "intent_sequence": ["create_project"],
+      "parameters": {},
+      "available_tools": []
+    },
+    "model_response": {
+      "mode": "meso_advanced",
+      "task_units": [{"id": "task_1", "title": "Shell fallback", "step_ids": ["step_1"]}],
+      "steps": [
+        {"id": "step_1", "task_id": "task_1", "step_type": "shell", "description": "Run shell fallback.", "args": {"command": "echo hi"}, "expected_output": "Shell output"}
+      ]
+    },
+    "expected": {
+      "planning_strategy": "invalid",
+      "plan_validation_status": "invalid",
+      "can_execute": false,
+      "step_count": 1,
+      "step_types": ["shell"],
+      "notes_contains": ["step_type=shell is not executable"]
+    }
+  },
+  {
+    "id": "llm_missing_tool_invalid",
+    "user_input": "use a missing specialized tool",
+    "task": {
+      "execution_strategy": "meso_advanced",
+      "task_type": "data_analysis",
+      "tool_strategy": "tool",
+      "intent": ["analyze"],
+      "intent_sequence": ["analyze"],
+      "parameters": {},
+      "available_tools": ["text_processor"]
+    },
+    "model_response": {
+      "mode": "meso_advanced",
+      "task_units": [{"id": "task_1", "title": "Analyze", "step_ids": ["step_1"]}],
+      "steps": [
+        {"id": "step_1", "task_id": "task_1", "step_type": "tool", "tool_name": "excel_parser", "description": "Parse excel.", "args": {"file_path": "data.xlsx"}, "expected_output": "Parsed data"}
+      ]
+    },
+    "expected": {
+      "planning_strategy": "invalid",
+      "plan_validation_status": "invalid",
+      "can_execute": false,
+      "step_count": 1,
+      "tool_names": ["excel_parser"],
+      "notes_contains": ["excel_parser is not in available_tools"]
+    }
+  },
+  {
+    "id": "llm_repaired_plan",
+    "user_input": "repair an invalid llm plan",
+    "task": {
+      "execution_strategy": "meso_advanced",
+      "task_type": "qa",
+      "tool_strategy": "model_only",
+      "intent": ["plan"],
+      "intent_sequence": ["plan"],
+      "parameters": {},
+      "available_tools": []
+    },
+    "model_response_sequence": [
+      {"mode": "meso", "steps": [{"id": "step_1", "task_id": "task_1", "step_type": "respond", "description": "Bad dependency.", "depends_on": ["missing_step"], "input_from": ["missing_step"], "expected_output": "Answer"}]},
+      {"mode": "meso", "task_units": [{"id": "task_1", "title": "Plan", "step_ids": ["step_1"]}], "steps": [{"id": "step_1", "task_id": "task_1", "step_type": "respond", "description": "Answer directly.", "expected_output": "Answer"}]}
+    ],
+    "expected": {
+      "planning_strategy": "llm_repaired",
+      "plan_validation_status": "repaired",
+      "can_execute": true,
+      "step_count": 1,
+      "step_types": ["respond"],
+      "notes_contains": ["repaired after 1 attempt"]
+    }
+  },
+  {
+    "id": "invalid_missing_read_file_path",
+    "user_input": "read a file",
+    "task": {
+      "execution_strategy": "meso",
+      "task_type": "document_understanding",
+      "intent": ["read_file"],
+      "intent_sequence": ["read_file"],
+      "parameters": {},
+      "available_tools": ["document_parser"]
+    },
+    "expected": {
+      "planning_strategy": "rule_template",
+      "plan_validation_status": "invalid",
+      "can_execute": false,
+      "step_count": 1,
+      "step_types": ["tool"],
+      "tool_names": ["document_parser"],
+      "notes_contains": ["document_parser requires file_path"]
+    }
+  }
+]

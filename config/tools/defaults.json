@@ -1,0 +1,15 @@
+{
+  "enabled": true,
+  "default_timeout_seconds": 30,
+  "max_output_chars": 12000,
+  "max_raw_output_chars": 50000,
+  "max_observation_chars": 16000,
+  "read_file_small_bytes": 65536,
+  "read_file_medium_bytes": 524288,
+  "read_file_hard_bytes": 8388608,
+  "read_file_preview_chars": 4000,
+  "read_file_range_max_lines": 400,
+  "default_observation_mode": "standard",
+  "workspace_root_policy": "workspace_only",
+  "logs_path": "logs/tools.log"
+}

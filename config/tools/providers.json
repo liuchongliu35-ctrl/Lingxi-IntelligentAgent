@@ -1,0 +1,34 @@
+{
+  "web_search": {
+    "enabled": true,
+    "provider": "auto",
+    "auto_order": ["search_api", "model_builtin"],
+    "timeout_seconds": 30,
+    "max_results": 5,
+    "max_query_chars": 400,
+    "allow_timeout_fallback": true,
+    "max_fallbacks": 1,
+    "search_api": {
+      "enabled": false,
+      "provider": "tavily",
+      "api_key_env": "TAVILY_API_KEY",
+      "endpoint": "https://api.tavily.com/search",
+      "timeout_seconds": 30,
+      "default_search_depth": "basic",
+      "default_topic": "general",
+      "include_answer": false,
+      "include_raw_content": false
+    },
+    "model_builtin": {
+      "enabled": false,
+      "provider_conf_id": "conf_openai_default",
+      "model_route": "web_search",
+      "enable_web_search": true,
+      "timeout_seconds": 30
+    },
+    "fake": {
+      "enabled": true,
+      "scenario": "success"
+    }
+  }
+}

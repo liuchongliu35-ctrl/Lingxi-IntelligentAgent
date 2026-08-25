@@ -1,0 +1,840 @@
+# Runtime / CLI / API 设计问题回答（2）
+
+本文档用于第二轮确认 Runtime / CLI / API 层的落地细节。请直接在每个“你的回答：”后面填写答案。
+
+第一轮已经确认的大方向：
+
+```text
+1. Runtime / CLI / API 统一放在 src/app/ 下。
+2. Runtime 是应用编排、依赖装配、会话生命周期和结果归一化层。
+3. CLI / API 共享同一套 Runtime，不各自实现 Agent 主流程。
+4. 正式 Runtime 模式下使用 manage_memory=False，消息写入由 Runtime / Memory 负责。
+5. Runtime 统一接管 ReActExecutor 事件回调。
+6. Runtime 同时保留 ExecutionResult 和 OutputFeedback。
+7. CLI 使用 Typer。
+8. API 使用 FastAPI。
+9. API 第一版需要 WebSocket 流式能力。
+10. main.py 收敛为薄启动器。
+```
+
+本轮只讨论实现前必须钉住的细节，不再重复大方向。
+
+---
+
+## 1. RuntimeResult 协议
+
+### 问题 1：Runtime 对外返回的 `RuntimeResult` 需要包含哪些固定字段？
+
+通俗解释：
+Runtime 会同时服务 CLI 和 API，所以它不能只返回字符串，也不能直接把内部对象原样抛给上层。需要一个稳定的结果对象。
+
+建议：
+第一版 `RuntimeResult` 固定包含：
+
+```text
+success: bool
+status: str
+session_id: str
+run_id: str
+output: str
+execution_result: dict | None
+output_feedback: dict | None
+memory_result: dict | None
+timeline: list[dict]
+requires_user_input: bool
+pending_confirmation: dict | None
+request_replan: bool
+replan_reason: str | None
+error_code: str | None
+error_message: str | None
+persistence_available: bool
+persistence_warning: str | None
+metadata: dict
+```
+
+其中：
+- `output` 是给 CLI 默认打印的最终文本。
+- `execution_result` 保留执行器结构化结果。
+- `output_feedback` 保留用户可见反馈结构。
+- `memory_result` 保留 Memory complete/fail 的结果。
+- `timeline` 用于 API/CLI 回放。
+
+为什么要问：
+这个对象会成为 CLI/API 的共同依赖，后续不应频繁变动。
+
+你的回答：采取你的建议
+
+---
+
+### 问题 2：Runtime 是否需要单独定义 `RuntimeEvent`，还是直接转发 ReActExecutor 的 `ExecutionEvent`？
+
+通俗解释：
+ReActExecutor 已经有 `ExecutionEvent`，但 Runtime 可能需要补充 session_id、run_id、source、sequence 等外层信息。
+
+建议：
+定义轻量 `RuntimeEvent` 包装：
+
+```text
+event_id
+session_id
+run_id
+event_type
+message
+visible_to_user
+payload
+source_event
+sequence
+created_at
+```
+
+但不要改变原始事件含义。RuntimeEvent 只是对外传输格式，不是新的执行事件体系。
+
+为什么要问：
+WebSocket / CLI 流式输出最好不要直接依赖执行器内部对象形态。
+
+你的回答：采取你的建议
+
+---
+
+### 问题 3：RuntimeResult 中是否允许包含内部调试信息？
+
+通俗解释：
+开发调试时可能想看更多字段，但普通用户和 API 调用方不应该看到内部 prompt、隐藏推理或 raw tool output。
+
+建议：
+默认不包含内部调试信息。只在显式 `debug=True` 时返回额外诊断字段，并且仍然必须脱敏。
+
+建议字段：
+
+```text
+metadata.debug:
+  analyzer_summary
+  plan_summary
+  event_count
+  model_profile
+  tool_profile
+```
+
+禁止字段：
+
+```text
+raw_prompt
+full_prompt
+hidden_reasoning
+raw_tool_result
+raw_observation
+api_key
+token
+cookie
+password
+```
+
+为什么要问：
+这会影响 API 安全边界和 CLI `--debug` 行为。
+
+你的回答：采取你的建议
+
+---
+
+## 2. WebSocket 流式协议
+
+### 问题 4：API WebSocket 第一版采用什么路径？
+
+通俗解释：
+WebSocket 需要一个稳定连接地址，前端或调用端才能连接并发送消息。
+
+建议：
+第一版使用：
+
+```text
+WS /ws/sessions/{session_id}/runs
+```
+
+如果没有 session_id，需要先用 `POST /sessions` 创建。这样会话边界更清晰。
+
+可选备用：
+
+```text
+WS /ws/runs
+```
+
+客户端在首条消息里传 session_id。这个更灵活，但第一版更容易混乱。
+
+我的建议：
+优先 `WS /ws/sessions/{session_id}/runs`。
+
+为什么要问：
+路径设计会影响 API 资源模型和前端接入方式。
+
+你的回答：采取你的建议，备用的那个就不需要了
+
+---
+
+### 问题 5：WebSocket 客户端发给服务端的消息格式怎么定义？
+
+通俗解释：
+WebSocket 不是普通 POST，请求参数要通过 JSON 消息传进去。
+
+建议：
+第一版客户端发送：
+
+```json
+{
+  "type": "run",
+  "input": "用户输入",
+  "stream": true,
+  "debug": false,
+  "metadata": {}
+}
+```
+
+后续确认/恢复可以发送：
+
+```json
+{
+  "type": "resume",
+  "run_id": "...",
+  "approved": true,
+  "confirmation_id": "...",
+  "preview_hash": "..."
+}
+```
+
+为什么要问：
+这决定 WebSocket 是只能发起新任务，还是后续可以承载确认/恢复。
+
+你的回答：采取你的建议
+
+---
+
+### 问题 6：WebSocket 服务端推送给客户端的事件格式怎么定义？
+
+通俗解释：
+执行过程中会有多种消息：开始、进度、工具、确认、完成、错误。
+
+建议：
+统一推送格式：
+
+```json
+{
+  "type": "event",
+  "session_id": "...",
+  "run_id": "...",
+  "event_type": "tool_started",
+  "message": "正在读取文件",
+  "visible_to_user": true,
+  "payload": {},
+  "sequence": 1
+}
+```
+
+最终完成推送：
+
+```json
+{
+  "type": "result",
+  "session_id": "...",
+  "run_id": "...",
+  "result": {...}
+}
+```
+
+错误推送：
+
+```json
+{
+  "type": "error",
+  "code": "runtime_error",
+  "message": "...",
+  "session_id": "...",
+  "run_id": "..."
+}
+```
+
+为什么要问：
+这决定前端/调用端如何统一消费流式数据。
+
+你的回答：采取你的建议
+
+---
+
+### 问题 7：WebSocket 第一版是否需要支持一个连接内多轮对话？
+
+通俗解释：
+一种方式是每次运行建立一次连接，运行结束就关闭；另一种是一个连接持续多轮。
+
+建议：
+第一版支持一个连接内多轮对话，但实现上保持简单：
+
+```text
+客户端每发送一条 type=run，就启动一轮。
+同一个连接内默认串行执行。
+上一轮未结束前，不允许同连接再启动新 run。
+```
+
+为什么要问：
+这会影响并发控制和连接生命周期。
+
+你的回答：采取你的建议，同一个websocket连接在同一时间只能有一个正在运行的对话，不处理新的用户发起的对话，用户发起的新对话可以放到等待队列，等当前正在运行的对话结束后再将队列里面的拿出来跑
+
+---
+
+## 3. CLI 落地细节
+
+### 问题 8：`agent chat` 默认是进入交互式 REPL，还是只执行单次输入？
+
+通俗解释：
+用户输入 `agent chat` 可以进入持续聊天；也可以要求必须传 `--message` 才执行一次。
+
+建议：
+两种都支持：
+
+```text
+agent chat
+  进入交互式 REPL。
+
+agent chat "帮我总结 README"
+  执行单次输入。
+
+agent chat --session-id <id>
+  在指定会话里交互。
+```
+
+为什么要问：
+这决定 CLI 的主要使用体验。
+
+你的回答：采取你的建议
+
+---
+
+### 问题 9：CLI 流式输出时，应该显示哪些事件？
+
+通俗解释：
+用户想看到执行过程，但不应该看到内部 prompt 或隐藏推理。
+
+建议：
+默认显示：
+
+```text
+progress_message
+step_started
+step_completed
+tool_started
+tool_finished
+command_started
+command_finished
+file_edited
+confirmation_requested
+final_answer
+system_notice
+```
+
+默认不显示：
+
+```text
+model_step_started
+model_step_finished
+action_selected 内部细节
+raw_observation
+raw_prompt
+```
+
+`--debug` 可显示更多事件摘要，但仍不显示敏感字段和隐藏推理。
+
+为什么要问：
+这决定 CLI 是否像真正的 Agent 执行过程，而不是黑盒等待。
+
+你的回答：采取你的建议
+
+---
+
+### 问题 10：CLI 是否需要支持确认交互？
+
+通俗解释：
+如果 Agent 要删除文件、执行命令或写入高风险内容，就可能需要用户确认。
+
+建议：
+需要支持。第一版交互式 CLI 可以这样做：
+
+```text
+Runtime 返回 waiting_user / pending_confirmation
+CLI 显示确认信息和 preview
+用户输入 y/n
+CLI 调用 Runtime.resume(...)
+```
+
+非交互模式下：
+- 默认不自动确认。
+- 可以后续加 `--yes`，但第一版谨慎起见不建议默认开放。
+
+为什么要问：
+这关系到文件、命令、MCP 等高风险工具能否在 CLI 下安全完成。
+
+你的回答：需要确认，采取你的建议
+
+---
+
+### 问题 11：CLI 的 session 列表展示需要哪些字段？
+
+通俗解释：
+用户需要从会话列表里选择旧会话继续。
+
+建议：
+`agent sessions` 默认展示：
+
+```text
+session_id
+title
+status
+created_at
+last_activity_at
+message_count
+last_run_status
+```
+
+`--json` 时返回完整结构。
+
+为什么要问：
+这会影响 Memory SessionInfo 是否够用，以及 CLI 格式化方式。
+
+你的回答：采取你的建议
+
+---
+
+## 4. API 路由和请求响应细节
+
+### 问题 12：`POST /sessions/{session_id}/runs` 的请求体需要哪些字段？
+
+通俗解释：
+这是 API 最核心的执行入口。
+
+建议：
+请求体：
+
+```json
+{
+  "input": "用户输入",
+  "stream": false,
+  "debug": false,
+  "metadata": {},
+  "model_profile": null,
+  "agent_version": null
+}
+```
+
+说明：
+- `stream=false` 时返回普通 JSON。
+- 如果要流式，走 WebSocket。
+- `metadata` 只保存脱敏后的入口信息。
+
+为什么要问：
+这会直接变成 API schema。
+
+你的回答：采取你的建议
+
+---
+
+### 问题 13：`POST /sessions` 是否允许指定 title 和 metadata？
+
+通俗解释：
+新建会话时可以自动生成，也可以让调用方传标题。
+
+建议：
+允许：
+
+```json
+{
+  "title": "项目开发会话",
+  "metadata": {}
+}
+```
+
+但 session_id 默认仍由系统生成。是否允许外部指定 session_id 可以作为可选字段，但必须经过 Memory 的合法性校验。
+
+为什么要问：
+这影响后续 UI 的会话列表展示。
+
+你的回答：采取你的建议，用户指定的session_id，需要进行校验看看这个id是否符合长度和格式的要求以及这个id是否已经存在，如果已经存在那就默认切换到已经存在的那个会话，同时需要提示一下需要用户进行确认y/n是否进入已有的这个会话（同时展示一下这个会话的一些信息），选择n那就默认无视用户传对的id，按照正常的流程创建新会话，选择y那就进入历史会话
+
+---
+
+### 问题 14：API 的 Result 包装体字段是否固定为 `success / data / error / code / trace_id / session_id / run_id`？
+
+通俗解释：
+你第一轮已经确认需要 API 自己的 Result 包装，这里需要定字段。
+
+建议：
+统一为：
+
+```text
+success: bool
+data: dict | list | null
+error: string | null
+code: string | null
+trace_id: string | null
+session_id: string | null
+run_id: string | null
+metadata: dict
+```
+
+所有 API 路由都返回这个壳，WebSocket 事件除外。
+
+为什么要问：
+这会影响所有 HTTP 路由测试。
+
+你的回答：可以采取你的建议
+
+---
+
+### 问题 15：API 是否需要第一版就做认证或 API Key？
+
+通俗解释：
+如果 API 只是本地开发用，可以先不做认证；如果未来要开放网络，就必须有认证。
+
+建议：
+第一版先做最小安全边界：
+
+```text
+默认只绑定 127.0.0.1。
+默认不启用认证。
+预留 API key middleware。
+如果配置了 APP_API_KEY，则请求必须带 Authorization: Bearer <key>。
+```
+
+为什么要问：
+API 能调用工具、读写文件、执行命令，不加边界会有风险。
+
+你的回答：目前我只是在本地跑这个agent，V1版本先不要做认证，就按照本地跑的系统去做
+
+---
+
+## 5. Resume / Cancel / Delete / Export 行为
+
+### 问题 16：`resume` 第一版主要用于确认恢复，还是也要支持断点续跑？
+
+通俗解释：
+确认恢复是“用户同意/拒绝某个危险动作后继续”。断点续跑是“进程中断后从中间状态继续执行”，难度大很多。
+
+建议：
+第一版只支持确认恢复：
+
+```text
+RuntimeResult.status = waiting_user
+pending_confirmation 存在
+用户确认或拒绝
+Runtime.resume(...) 调用 ReActExecutor.resume_after_confirmation(...)
+```
+
+不承诺跨进程断点续跑。程序重启后的 running/waiting_user run 由 Memory 标记为 interrupted。
+
+为什么要问：
+这关系到第一版范围是否会爆炸。
+
+你的回答：采取你的建议，第一版不做断点续跑，这个涉及的东西太多，第一版只支持确认恢复
+
+---
+
+### 问题 17：`cancel` 第一版应该取消什么？
+
+通俗解释：
+取消可以表示取消当前等待确认，也可以表示中断正在执行的任务。
+
+建议：
+第一版先支持取消等待确认的 run：
+
+```text
+waiting_user -> cancelled
+记录用户取消事件
+不继续执行 pending action
+```
+
+不承诺强制中断正在运行的线程或工具进程。正在执行中的取消留给后续异步任务系统。
+
+为什么要问：
+同步 Runtime 下强行取消正在执行的工具很复杂，第一版应避免虚假承诺。
+
+你的回答：采取你的建议
+
+---
+
+### 问题 18：`delete_session` 是否真实删除 SQLite 历史？
+
+通俗解释：
+删除会话是敏感操作。可以软删除，也可以硬删除。
+
+建议：
+第一版 Runtime API 可以先提供硬删除，但 CLI/API 都需要明确命令或 HTTP DELETE。
+
+规则：
+```text
+delete_session(session_id)
+  -> 调用 SessionManager.delete_session(session_id)
+  -> 删除 messages / runs / events / summaries
+```
+
+如果你希望可恢复，后续再增加 archive/soft delete。
+
+为什么要问：
+这会影响用户数据保留策略。
+
+你的回答：采取你的建议
+
+---
+
+### 问题 19：`export_session` 第一版是否要实现？
+
+通俗解释：
+导出会话可以导出 Markdown 或 JSON，但这不是主链路必须能力。
+
+建议：
+如果第一版要实现，建议只做 JSON 导出：
+
+```text
+session_state
+timeline
+summaries
+```
+
+Markdown 导出可以后置。
+
+也可以第一版只预留接口，开发计划里放到后续阶段。
+
+为什么要问：
+第一轮你希望可选路由也实现，但导出功能如果做得太完整会增加开发面。
+
+你的回答：可以实现，从数据库中将会话中的对话列表组装成markdown文件导出
+
+---
+
+## 6. Runtime Factory 和依赖生命周期
+
+### 问题 20：Runtime 依赖是进程级单例，还是每次请求重新创建？
+
+通俗解释：
+ModelManager、ToolManager、SessionManager 这些对象创建成本和状态不同。
+
+建议：
+第一版采用进程级 Runtime 实例：
+
+```text
+API 启动时创建一个 Runtime。
+CLI 每次启动创建一个 Runtime。
+单个 Runtime 内共享 ModelManager / ToolManager / SessionManager。
+```
+
+不建议每次 run 都重建所有依赖，否则配置、日志、模型健康状态和工具状态会不稳定。
+
+为什么要问：
+这影响性能、状态共享和测试隔离。
+
+你的回答：采取你的建议
+
+---
+
+### 问题 21：Runtime factory 是否需要支持依赖注入，用于测试 fake model / fake tool / temp SQLite？
+
+通俗解释：
+测试时不能总用真实模型、真实工具和正式数据库。
+
+建议：
+需要支持。factory 应允许传入：
+
+```text
+model_manager
+tool_manager
+session_manager
+memory_adapter
+react_agent
+workspace_root
+config
+```
+
+默认生产路径自动创建；测试路径可以注入 fake。
+
+为什么要问：
+这决定 Runtime 是否可测试。
+
+你的回答：采取你的建议，测试和验收Runtime/cli/api层的时候可以按照这个来做，但是后续agent整体测试的时候我还是会使用真实的模型、真实工具和正式数据库的。
+
+---
+
+### 问题 22：Runtime 是否需要在启动时执行恢复逻辑？
+
+通俗解释：
+如果上次程序崩溃，SQLite 中可能有 running/waiting_user 的 run。
+
+建议：
+Runtime 初始化时调用：
+
+```python
+SessionManager.recover_interrupted_runs()
+```
+
+将 `pending / running / waiting_user` 标记为 `interrupted`。
+
+为什么要问：
+这能避免旧 run 永远卡在 running。
+
+你的回答：采取你的建议
+
+---
+
+## 7. 错误码和状态映射
+
+### 问题 23：Runtime 是否需要定义自己的错误码枚举？
+
+通俗解释：
+底层 Models、Tools、Memory 都有自己的错误码，但 Runtime 对外应该统一。
+
+建议：
+需要定义 `RuntimeErrorCode`，至少包括：
+
+```text
+validation_error
+session_not_found
+run_not_found
+memory_unavailable
+persistence_warning
+agent_execution_failed
+blocked_by_policy
+waiting_user
+request_replan
+cancelled
+interrupted
+dependency_init_failed
+api_error
+internal_error
+```
+
+为什么要问：
+这会影响 API Result 和 CLI 退出码。
+
+你的回答：采取你的建议
+
+---
+
+### 问题 24：HTTP 状态码如何映射 Runtime 状态？
+
+通俗解释：
+API 不应所有情况都返回 200，也不应把 waiting_user 当作 500。
+
+建议：
+
+```text
+completed / success      -> 200
+waiting_user             -> 202
+request_replan           -> 202
+validation_error         -> 400
+session_not_found        -> 404
+run_not_found            -> 404
+blocked_by_policy        -> 403
+cancelled                -> 409
+interrupted              -> 409
+memory_unavailable       -> 503
+dependency_init_failed   -> 503
+internal_error           -> 500
+```
+
+为什么要问：
+这会影响 API 调用方如何判断结果。
+
+你的回答：采取你的映射建议
+
+---
+
+### 问题 25：CLI 退出码如何映射 Runtime 状态？
+
+通俗解释：
+CLI 默认用于人，但也可能被脚本调用。
+
+建议：
+
+```text
+success / completed      -> 0
+waiting_user             -> 0
+request_replan           -> 0
+validation_error         -> 1
+session_not_found        -> 1
+blocked_by_policy        -> 2
+cancelled                -> 2
+interrupted              -> 2
+memory_unavailable       -> 3
+dependency_init_failed   -> 3
+internal_error           -> 3
+```
+
+为什么要问：
+这会影响自动化脚本和测试。
+
+你的回答：采取你的建议
+
+---
+
+## 8. 第一版验收范围
+
+### 问题 26：第一版是否要同时完成 Runtime、CLI 和 API，还是分阶段完成？
+
+通俗解释：
+一次性全做风险较大，但 Runtime 如果没有 CLI/API 验收，也不能证明入口层可用。
+
+建议：
+分阶段，但同一轮设计覆盖三者：
+
+```text
+阶段 1：Runtime 核心 + 单元测试
+阶段 2：CLI + Runtime 集成测试
+阶段 3：API REST + Runtime 集成测试
+阶段 4：WebSocket 最小流式 + 端到端测试
+阶段 5：main.py 收口 + 文档回写
+```
+
+为什么要问：
+这会影响开发计划和验收节奏。
+
+你的回答：是，V1版本这三个都需要做完，可以按照 Runtime、CLI 和 API这个顺序来做，先做Runtime，再做CLI，最后做API，但是在设计阶段这三个的设计文档和后续对的步骤进度文档都必须完成，我后续再按照以上顺序去完成这三个部分
+
+---
+
+### 问题 27：第一版端到端测试需要覆盖哪些场景？
+
+通俗解释：
+Runtime 作为入口层，必须证明跨层真的能协作。
+
+建议：
+至少覆盖：
+
+```text
+1. 新 session 普通对话。
+2. 指定 session 多轮对话。
+3. 可见事件进入 timeline。
+4. 内部事件不进入 timeline。
+5. CLI chat 单轮。
+6. CLI sessions / timeline。
+7. API 创建 session。
+8. API 发起 run。
+9. WebSocket 推送 event 和 result。
+10. waiting_user / pending_confirmation。
+11. blocked_by_policy。
+12. Memory 持久化失败 warning。
+```
+
+为什么要问：
+这会成为开发完成后的验收矩阵。
+
+你的回答：采取你的建议
+
+---
+
+## 9. 当前结论
+
+第二轮确认完成后，应能直接进入：
+
+```text
+Runtime / CLI / API 架构设计文档
+Runtime / CLI / API 开发步骤与验收标准
+Runtime 核心实现
+CLI / API 入口实现
+跨层联调验收
+```
+
+本轮重点不是再讨论“Runtime 要不要做”，而是把“Runtime 怎么对外、怎么流式、怎么错误映射、怎么确认恢复、怎么测试”定清楚。

@@ -1,0 +1,36 @@
+{
+  "react_action_decision": {
+    "default_model_policy": "user_selected",
+    "params": {
+      "temperature": 0.1,
+      "top_p": 0.9,
+      "max_tokens": 1200,
+      "json_mode": true,
+      "timeout_seconds": 60
+    },
+    "candidates": []
+  },
+  "summary": {
+    "default_model_policy": "user_selected",
+    "params": {
+      "temperature": 0.3,
+      "max_tokens": 2000
+    },
+    "candidates": []
+  },
+  "web_search": {
+    "default_model_policy": "user_selected",
+    "params": {
+      "temperature": 0.0,
+      "max_tokens": 1800,
+      "json_mode": true,
+      "timeout_seconds": 30
+    },
+    "candidates": []
+  },
+  "embedding": {
+    "default_model_policy": "explicit_candidates",
+    "params": {},
+    "candidates": []
+  }
+}

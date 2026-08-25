@@ -1,0 +1,18 @@
+{
+  "max_execution_turns": 20,
+  "max_step_turns": 5,
+  "max_action_packet_repair_attempts": 5,
+  "default_tool_max_retries": 3,
+  "retry_backoff_base_seconds": 0.2,
+  "retry_backoff_max_seconds": 2.0,
+  "enable_llm_reasoning": true,
+  "enable_llm_checker": true,
+  "enable_command_tool": true,
+  "command_confirmation_policy": "ask",
+  "workspace_root": ".",
+  "react_executor_log_path": "logs/react_executor.log",
+  "event_stream_enabled": true,
+  "log_full_prompt": false,
+  "max_model_observation_chars": 2000,
+  "max_recent_observations": 5
+}

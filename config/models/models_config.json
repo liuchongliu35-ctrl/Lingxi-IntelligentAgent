@@ -1,0 +1,14 @@
+{
+  "default_chat_route": "chat",
+  "default_structured_route": "structured",
+  "default_embedding_route": "embedding",
+  "default_compression_route": "context_compression",
+  "default_mock_enabled": true,
+  "real_provider_enabled_by_default": false,
+  "max_retries": 5,
+  "retry_backoff_base_seconds": 0.5,
+  "retry_backoff_max_seconds": 8,
+  "logs_path": "logs/models.log",
+  "log_full_prompt": false,
+  "log_full_response": false
+}

@@ -1,0 +1,2061 @@
+# Models 设计问题回答（1）
+注意：这里开发的模型既然好做工程化处理那不管是原先就的接口还是新接口都统一对外返回结构化结果，废掉原先只直接返回模型输出结果（str类型）的处理方式
+本文档用于第一轮确认 Models 层 V1 正式化的设计问题。请直接在每个“你的回答：”后面填写答案。
+
+说明：
+- 这些问题不是考试题，目的是把 Models 层 V1 的职责边界、配置方式、provider 接入、模型路由、结构化输出、稳定性策略、日志指标和验收步骤定清楚。
+- Models 层必须服务当前已经完成的 Analyzer V1、Planner V1 和 ReActExecutor V1，不重新设计三层主链路。
+- 当前主链路已经是：
+
+```text
+用户输入
+  -> ReactAgent
+  -> Analyzer
+  -> Planner
+  -> ReActExecutor
+  -> Tool / Model
+  -> Observation / Checker
+  -> ExecutionResult / ExecutionEvent
+```
+
+- ReActExecutor 已经要求模型通过 `ActionPacket` 等结构化协议和执行器交互；Observation 必须由执行器根据真实 Tool / Model / User / Control 结果生成，模型不能伪造 Observation。
+- 旧 `Executor` 仍保留为 legacy 回退，但它的模型调用也需要同步迁移。Models 层 V1 的对外接口统一返回结构化结果，模型文本放在 `content` 等字段中，不再把裸字符串作为正式模型服务接口。
+- 如果你不确定，可以写“按你的建议来”，后续我会按任务型 Agent 的常见工程做法给出保守方案。
+- 有些问题后面写了“为什么要问”，方便你理解这个问题会影响哪部分设计。
+- 如果本轮回答后仍有不明确的点，后续会继续生成 `Models设计问题回答(2).txt`、`Models设计问题回答(3).txt` 等。
+
+当前 Models 层真实状态：
+
+```text
+src/models/base_model.py       # BaseModel: generate / stream_generate / health_check
+src/models/mock_model.py       # MockModel: 无 API key 时占位响应
+src/models/model_manager.py    # 按 MODEL_NAME 选择 mock/openai/qianwen/doubao
+src/models/openai_model.py     # OpenAI provider 雏形
+src/models/qianwen_model.py    # Qianwen provider 雏形
+src/models/doubao_model.py     # Doubao provider 雏形
+```
+
+当前主要调用点：
+
+```text
+Analyzer LLM fallback:
+  src/agent/complexity_analyzer.py
+  self.model_manager.generate(prompt)
+
+Planner LLM planner:
+  src/agent/planner.py
+  self.model_manager.generate(prompt)
+
+legacy Executor model step:
+  src/agent/executor.py
+  self.model_manager.generate(prompt)
+
+ReActExecutor call_model:
+  src/agent/react_executor.py
+  self.model_manager.generate(prompt)
+
+ReActExecutor ActionPacket decision:
+  src/agent/react_executor.py
+  self.model_manager.generate(prompt)
+```
+
+因此 Models V1 的关键任务不是“再包装一个 API 调用”，而是让真实模型稳定服务下面几类任务：
+
+```text
+Analyzer 结构化意图兜底
+Planner 结构化计划兜底
+ReActExecutor ActionPacket 决策
+ReActExecutor call_model 中间结果
+普通 chat / respond / summary 文本生成
+后续 Memory / RAG 的摘要和 embedding
+```
+
+---
+
+## 1. Models 层在整体 Agent 中的定位
+
+### 问题 1：你是否同意 Models 层只负责“模型服务能力”，不重新承担 Analyzer / Planner / ReActExecutor 的职责？
+
+通俗解释：
+Analyzer 负责理解和路由；Planner 负责生成初始计划；ReActExecutor 负责执行循环、校验 ActionPacket、调用工具、生成 Observation 和 Checker 转移。Models 层不应该重新判断用户意图、不应该自己决定调用工具，也不应该生成 Observation。
+
+建议：
+Models V1 定位为统一模型服务层：
+
+```text
+请求封装
+  -> provider 选择
+  -> 模型调用
+  -> 返回结构化 ModelCallResult
+  -> 记录模型调用日志和指标
+```
+
+Models 层可以帮助解析 JSON 和做通用 repair，但不能替代 ReActExecutor 的 ActionPacket 业务校验。
+
+为什么要问：
+这决定 Models 层是基础服务层，还是会变成第二个执行器。
+
+你的回答：是的
+
+
+### 问题 2：Models V1 是否把 `generate()` 本身改为返回 `ModelCallResult` 等结构化结果？
+
+通俗解释：
+当前 Analyzer、Planner、legacy Executor 和 ReActExecutor 都直接调用 `generate()`，并期待拿到字符串。Models V1 正式化后，不应该再额外保留一个“字符串主接口”和一个“结构化新接口”，而应该直接修改 `generate()` 的返回类型，让所有调用方统一消费结构化结果。
+
+建议：
+正式对外接口统一为：
+
+```python
+generate(...) -> ModelCallResult
+stream_generate(...) -> Generator[ModelStreamChunk, None, ModelStreamResult]
+generate_json(...) -> StructuredModelResult
+```
+
+其中：
+
+```python
+ModelCallResult.content
+ModelCallResult.success
+ModelCallResult.error
+ModelCallResult.code
+ModelCallResult.provider
+ModelCallResult.model
+ModelCallResult.attempts
+ModelCallResult.latency_ms
+ModelCallResult.usage
+```
+
+`ModelCallResult.content` 保存模型正常生成的文本，其他字段保存调用状态、错误信息、provider/model、重试次数、耗时和 usage。`stream_generate()` 也不返回裸字符串 chunk，而是返回带内容、序号、结束状态和错误信息的 `ModelStreamChunk`。
+
+Analyzer、Planner、ReActExecutor 以及 legacy Executor 都需要同步适配。需要字符串时只能显式读取 `result.content`，不能让 Models 层直接返回裸字符串。
+
+为什么要问：
+这决定 Models 层是否真正形成统一协议，也决定旧 Executor 和既有测试是否需要同步迁移。
+
+你的回答：采取你的建议
+
+
+### 问题 3：Models V1 的第一优先级是 provider 正式化，还是结构化输出正式化？
+
+这里其实是在问：先解决“能不能稳定调用模型”，还是先解决“能不能正确消费模型返回结果”。
+选项：
+
+```text
+A. 先 provider 正式化：配置、真实 API、timeout、retry、错误封装
+B. 先结构化输出：JSON 解析、repair、schema、ActionPacket 支撑
+C. 两者并行，但每个 Step 小步推进
+```
+
+建议：
+选 C，但开发顺序先做“配置中心 + 结构化结果对象”，再做 provider 和 JSON 能力。原因是 provider 和结构化输出都需要统一调用结果对象支撑。
+
+为什么要问：
+这影响 Models 层开发步骤文档的 Step 1 / Step 2 排序。
+
+你的回答：按你的建议来，先做共同底座，再逐步完成 provider 正式化和结构化输出正式化。
+
+
+### 问题 4：Models V1 是否要把模型层视为“可观测服务”，而不是简单 SDK wrapper？
+
+通俗解释：
+真实模型调用会有超时、429、API key 缺失、网络失败、JSON 乱输出、成本、延迟、token 超限等问题。如果 Models 层只返回字符串，上层很难判断失败原因。
+
+建议：
+是。Models V1 应输出结构化调用记录，至少包含：
+
+```text
+success
+content
+error
+code
+provider
+model
+route
+request_id
+latency_ms
+prompt_tokens
+completion_tokens
+total_tokens
+cost
+attempts
+raw_response
+metadata
+```
+
+为什么要问：
+这决定后续日志、观测、重试和错误分类是否有统一基础。
+
+你的回答：采取你的建议，既然模型单独做一层并且是基础服务层所以这些工程化细节需要做，因为这不仅仅只是简单的SDK模型接口调用了，为了后续可以稳定跑和观测需要这样做
+
+
+---
+
+## 2. 兼容接口与新协议
+
+### 问题 5：正式模型接口失败时是否统一返回 `success=False` 的 `ModelCallResult`？
+
+当前状态：
+`ModelManager.generate()` 捕获异常并返回：
+
+```text
+Model call failed: ...
+```
+
+建议：
+正式主接口不要把错误吞成普通文本，也不要把 provider 异常直接抛给业务层，而是经过重试后返回结构化失败：
+
+```python
+ModelCallResult(
+    success=False,
+    content="",
+    error="...",
+    code="model_call_failed",
+    attempts=5
+)
+```
+
+重试建议：
+
+```text
+最多重试 5 次
+使用指数级退避
+只有可重试错误才重试，例如 timeout / rate_limited / network_error / provider_server_error
+重试后仍失败才返回 success=False
+```
+
+`generate()` 本身应直接返回 `ModelCallResult`，不再保留“返回错误字符串”的正式路径。模型文本放在 `content`，调用状态、错误码、重试次数、provider、耗时和 usage 放在其他字段中。所有调用方都必须先判断 `success`，再消费 `content`。
+
+为什么要问：
+如果模型失败被伪装成字符串，ReActExecutor 可能把错误文本当作模型回答继续消费。
+
+你的回答：现有调用不是给什么消费什么吗，既然要改那就完整都进行修改，不要短期保留旧的处理方式了，直接统一修改成规定的格式让调用方知道模型generate()调用出错了（当然这个肯定需要经过规定的几轮重试后如果还是调用模型失败才这样处理，建议重试5次，指数级退避）
+这里需要说下，既然模型层后续设计使用的是新的处理方式，那调用模型层然后进行消费的层也需要顺着新的设计处理做调整，这个不是死的，这个是一个系统，各部分是关联起来的，既然模型层要做新的调整那其他关联的就需要跟着做调整
+
+
+### 问题 6：新接口是否需要区分“模型正常回答的文本”和“模型调用失败的错误”？
+
+建议：
+必须区分。`content` 只放模型真实生成内容；错误放到 `error/code`。
+
+示例：
+
+```python
+ModelCallResult(
+    success=False,
+    content="",
+    error="OPENAI_API_KEY is not configured",
+    code="missing_api_key"
+)
+```
+
+为什么要问：
+Analyzer / Planner / ReActExecutor 都需要知道失败是模型内容问题，还是模型服务问题。
+
+你的回答：采取你的建议
+
+
+### 问题 7：是否需要新增 `ModelMessage` 协议，支持 system/user/assistant 多消息，而不只是单 prompt 字符串？
+
+通俗解释：
+现在所有调用都是 `prompt: str`。但真实模型通常更适合：
+
+```python
+[
+  {"role": "system", "content": "..."},
+  {"role": "user", "content": "..."}
+]
+```
+
+建议：
+V1 新增内部消息协议，但保留 `prompt: str` 自动转换为单条 user message。
+
+为什么要问：
+这影响 OpenAI、Qianwen、Doubao provider 的统一请求格式，也影响后续 system prompt 和模型路由。
+
+你的回答：需要，采取你的建议，使用模板Prompt来做，区分角色
+
+
+### 问题 8：是否需要将模型调用类型固定为枚举？
+
+建议：
+需要。建议先支持：
+
+```text
+chat
+analyzer_intent_fallback
+planner_structured_plan
+react_action_decision
+react_action_repair
+react_call_model
+checker_semantic
+summary
+memory_summary
+rag_answer
+embedding
+```
+
+为什么要问：
+模型路由、日志、成本统计、prompt 模板、temperature、max_tokens 都依赖调用类型。
+
+你的回答：这个想法好我学到了，就这样做，如果可以的话可以再拓展一些字段，反正尽量囊括多一些可以处理的场景多一些
+
+
+---
+
+## 3. 模型配置中心
+
+### 问题 9：Models 配置是否采用 `config/models/` 目录，而不是继续只放 `.env`？
+
+建议：
+采用配置文件 + 环境变量覆盖，并区分静态能力注册和运行时配置：
+
+```text
+config/models/
+  models_config.json
+  provider_specs.json
+  provider_confs.json
+  routes.json
+  pricing.json
+  structured_output.json
+```
+
+建议概念：
+
+```text
+ProviderSpec:
+  静态注册表，描述 provider / protocol 的天生能力。
+  例如 provider 类型、protocol、默认 base_url、默认模型、是否支持 streaming、json mode、embedding、vision、默认 timeout、请求/响应 adapter。
+
+ProviderConf:
+  运行时配置，描述用户实际启用的模型服务。
+  例如显示名称、provider、protocol、base_url、api_key_env 或加密凭证引用、model_id、自定义 headers、状态。
+```
+
+`.env` 只放内置 provider 的密钥、默认 provider 和少量运行开关。用户通过“添加自定义模型”配置的 key，后续如果做 UI/Session 层，应进入本地加密凭证存储，而不是明文写入普通 JSON。
+
+关键点：
+ProviderSpec 和 ProviderConf 不应该只靠“模型名称”隐式串联。V1 应优先通过 `provider_conf_id` 显式选中运行时配置，再由 ProviderConf 中的 `provider/protocol` 找到对应 ProviderSpec。模型名称只用于指定本次调用的上游模型，不承担唯一识别 provider 配置的职责。
+
+为什么要问：
+provider endpoint、默认模型、超时、重试、路由、价格都放 env 会难以维护。
+
+你的回答：可以，模型的配置专门进行管理
+
+
+### 问题 10：`.env` 中是否继续保留 `MODEL_NAME`，还是改成 `DEFAULT_MODEL_PROVIDER`？
+
+当前状态：
+
+```env
+MODEL_NAME=mock
+DEFAULT_CHAT_MODEL=mock
+```
+
+建议：
+V1 正式配置不再使用 `MODEL_NAME`，改用更明确的模型配置中心和默认路由配置：
+
+```env
+DEFAULT_CHAT_MODEL=mock
+DEFAULT_STRUCTURED_MODEL=mock
+DEFAULT_EMBEDDING_MODEL=mock
+```
+
+如果旧 `.env` 里还有 `MODEL_NAME`，可以在迁移文档里说明“已废弃”，但 Models V1 代码和步骤文档不把它作为正式配置入口。
+
+为什么要问：
+“模型名”和“provider 名”不是一回事。`openai` 是 provider，`gpt-4o-mini` 才是模型名。
+
+你的回答：旧配置不要了，直接换用新的配置方案吧，既然要使用新的方案那旧的方案就干脆抛弃，不然混在一起不好，要换就换干脆一些
+
+
+### 问题 11：ProviderSpec 和 ProviderConf 至少需要哪些字段？
+
+建议拆成两类字段。
+
+ProviderSpec 至少包含：
+
+```text
+provider
+protocol
+display_name
+default_base_url
+default_model
+supports_streaming
+supports_json_mode
+supports_tool_calling
+supports_embedding
+supports_vision
+supports_custom_headers
+default_timeout_seconds
+default_max_retries
+request_adapter
+response_adapter
+known_model_prefixes
+tags
+```
+
+ProviderConf 至少包含：
+
+```text
+id
+name
+provider
+protocol
+enabled
+base_url
+api_key_env 或 credential_ref
+default_model
+custom_models
+headers
+timeout_seconds
+max_retries
+temperature
+max_tokens
+max_context_tokens
+status
+verified_at
+metadata
+```
+
+为什么要问：
+内置 OpenAI / Qianwen / Doubao 和用户自定义模型都需要走同一套抽象。ProviderSpec 解决“这类 provider 天生支持什么”，ProviderConf 解决“用户当前配置了哪个 endpoint/key/model”。
+
+补充建议：
+ProviderConf 应该能被 `provider_conf_id` 唯一引用。路由层、verify、health check、日志和未来 UI 都基于这个 id 找到具体 endpoint、凭证和默认模型，而不是根据模型名称猜测配置。
+
+你的回答：采取你的建议，如果有实际需求除了你建议里面的字段可以再增添字段
+
+
+### 问题 12：密钥如何存储，内置 provider 和用户自定义 provider 是否分开处理？
+
+建议：
+密钥不要明文写入普通配置文件。建议分两类处理：
+
+```text
+内置 provider:
+  从环境变量读取，例如 OPENAI_API_KEY / DASHSCOPE_API_KEY。
+  ProviderConf 里只写 api_key_env。
+
+用户自定义 provider:
+  后续如果有管理界面，key 应进入本地加密凭证存储。
+  ProviderConf 里只写 credential_ref。
+```
+
+示例：
+
+```json
+{
+  "id": "conf_openai_default",
+  "provider": "openai",
+  "api_key_env": "OPENAI_API_KEY",
+  "credential_ref": null
+}
+```
+
+用户自定义配置示例：
+
+```json
+{
+  "id": "conf_my_deepseek",
+  "name": "我的 DeepSeek",
+  "provider": "custom",
+  "protocol": "openai-compatible",
+  "base_url": "https://api.deepseek.com/v1",
+  "credential_ref": "cred_my_deepseek",
+  "default_model": "deepseek-chat"
+}
+```
+
+为什么要问：
+避免把 API key 写入项目配置文件或日志，同时给后续类似 Cursor 的“添加自定义模型”能力预留安全存储方式。
+
+你的回答：从环境变量读取
+
+
+### 问题 13：如果配置文件不存在或字段缺失，Models 层应该如何降级？
+
+建议：
+不静默降级到 `mock`。如果调用方请求真实模型，但配置文件不存在、字段缺失、provider 未启用、模型名缺失或 API key 缺失，Models 层应返回结构化失败，而不是自动切换成 mock：
+
+```python
+ModelCallResult(
+    success=False,
+    content="",
+    error="model configuration is missing",
+    code="missing_model_config"
+)
+```
+
+MockModel 只在显式配置为 mock 或测试 fixture 明确注入 mock 时使用。
+
+为什么要问：
+这决定“配置错误”会不会被隐藏。真实用户使用时，缺模型配置应该让 Runtime/API/UI 层能明确提示用户去配置模型，而不是让 Agent 看似正常但实际返回 mock 内容。
+
+你的回答：Models 层不应在真实模型未配置时静默降级到 mock。
+如果调用方请求真实模型，但配置不存在、provider 未启用、模型名缺失或 API key 缺失，应返回结构化失败：
+
+ModelCallResult(
+    success=False,
+    content="",
+    error="model configuration is missing",
+    code="missing_model_config"
+)
+上层根据错误码生成用户可见提示，例如“当前模型未配置，请先配置模型 API key 或切换到 mock 模式”。
+
+
+### 问题 14：真实 provider 未配置 API key 时，是否应该在初始化时报错？
+
+当前状态：
+`OpenAIModel/QianwenModel/DoubaoModel.__init__()` 缺 key 直接抛异常。
+
+建议：
+provider 初始化可以成功，但 `health_check()` 返回 false；真实调用时返回结构化 `missing_api_key`。这样 `ModelManager` 可以启动并给出清晰状态。
+
+为什么要问：
+如果初始化时报错，`MODEL_NAME=openai` 但没 key 时整个 Agent 可能无法启动。
+
+你的回答：采取你的建议，agent的正常启动能被是否配置过模型束缚，agent启动和一些初始化可以正常走，只是在和agent交谈时发现模型调用不了再提示没有配置API key
+
+
+---
+
+## 4. Provider 优先级与真实集成边界
+Provider 是什么东西？
+回答：Provider
+  -> 管 API 地址、鉴权方式、请求格式、响应解析方式
+  -> 下面可以挂多个 model
+  不同的模型在鉴权，请求，响应的数据结构方面都不一样，所以需要一个Provider来调度管理
+### 问题 15：真实 provider 的优先正式化顺序是什么？
+
+选项：
+
+```text
+A. OpenAI 优先
+B. Qianwen / DashScope 优先
+C. Doubao 优先
+D. 三个 provider 都先统一配置和接口，真实联调按 key 可用性后置
+```
+
+建议：
+选 D。先做统一 provider 接口和 mock 测试；真实 API 集成测试检测到对应 API key 时才运行。
+
+为什么要问：
+这影响第一批 provider 代码是否需要真实网络验收。
+
+你的回答：采取你的建议
+
+
+### 问题 16：OpenAI provider 是否使用官方 `openai` SDK，还是继续兼容当前写法？
+
+建议：
+使用 `openai` SDK 的新客户端方式，但封装在 provider 内，不让上层感知 SDK 细节。当前 `openai.api_key = ...` 的全局状态写法应逐步替换。
+
+为什么要问：
+全局 SDK 状态不利于多 provider、多 base_url、多模型路由和测试隔离。
+
+你的回答：采取你的建议，使用 `openai` SDK 的新客户端方式
+
+
+### 问题 17：Qianwen provider 使用 DashScope 原生接口，还是走 OpenAI-compatible endpoint？
+
+背景：
+Qianwen 可以有不同接入方式。当前代码使用 DashScope text-generation HTTP 接口。
+
+建议：
+V1 优先统一使用 OpenAI-compatible endpoint。Qianwen 不再优先走 DashScope 原生 text-generation 接口，而是通过 OpenAI-compatible 协议接入，统一 messages、streaming、JSON 输出和错误处理。
+
+原生 DashScope 接口可以作为后续 provider variant 预留，但不作为 V1 主路径。
+
+为什么要问：
+这影响请求/响应解析和流式输出实现。
+
+你的回答：优先统一使用 OpenAI-compatible endpoint。Qianwen V1 不再优先走 DashScope 原生 text-generation 接口，而是通过 OpenAI-compatible 协议接入，统一 messages、streaming、JSON 输出和错误处理。原生 DashScope 接口可以作为后续 provider variant 预留，但不作为 V1 主路径。
+
+
+### 问题 18：Doubao provider 的 endpoint id 是否必须配置化？
+
+当前状态：
+`doubao_model.py` 中模型 id 是硬编码：
+
+```text
+ep-20240414141157-8sw7r
+```
+
+建议：
+必须配置化。默认可以为空，缺失时 health_check 返回 false 或调用返回 `missing_model_config`。
+
+为什么要问：
+豆包通常使用用户自己的 endpoint id，硬编码不可复用。
+
+你的回答：所有模型都需要配置化，目前写的代码都是大致的东西只是做一个参考，要工程化的话目前的模型层的代码肯定是不行的，所以我现在才需要和你进行问答来进行全面的设计
+还有就是本agent可支持用户添加模型，自定义模型的url，密钥等等配置，然后可以左右选择使用agent已经默认配置的模型还是使用自己添加的模型，就像cursor 一样可以自己添加自定义的模型接口
+
+
+### 问题 19：Models V1 是否要正式支持用户添加自定义 OpenAI-compatible provider？
+
+通俗解释：
+很多模型服务都兼容 OpenAI Chat Completions 协议，只需要配置 `base_url/api_key/model`。这类能力类似 Cursor 的“添加自定义模型”：用户不改代码，只填 endpoint、key 和 model id，就能把第三方模型接入 Agent。
+
+建议：
+V1 应把 `openai-compatible` 作为默认自定义模型协议正式支持，而不是只预留字段。
+
+自定义模型至少需要：
+
+```text
+显示名称
+provider_type / protocol = openai-compatible
+base_url
+api key 或 credential_ref
+model_id / default_model
+custom_models
+timeout_seconds
+max_context_tokens
+supports_streaming
+supports_json_mode
+headers
+status
+verified_at
+```
+
+V1 可以先不做完整 UI，但配置文件和 ProviderConf 数据结构要按“未来可添加自定义模型”设计。
+
+为什么要问：
+这决定 provider 抽象是写死三家，还是支持配置驱动热插拔模型。
+
+你的回答：需要，这个就是我上一个问题提到的，agent默认提供的三家模型，但是也可以自己添加，比如想换claude或者gpt的模型都可以，我记得我在使用cursor的模型配置是好像有几种配置方式，这个自定义模型添加的具体方案我会在另外一个文件里面说一下的
+
+
+### 问题 19.1：添加自定义模型后是否必须支持验证 Verify 流程？
+
+通俗解释：
+用户填写 base_url、key、model_id 后，系统应该能发一个极简测试请求，确认连接、鉴权、模型权限和响应结构都正常，再把配置标记为可用。
+
+建议：
+需要。V1 即使不做 UI，也应该在 Models 层提供验证接口：
+
+```python
+verify_provider_config(provider_conf_id) -> ModelHealthStatus
+```
+
+验证内容：
+
+```text
+base_url 可访问
+key / credential_ref 可用
+model_id 存在或可调用
+返回结构能解析成 ModelCallResult
+streaming / json mode 等能力可选验证
+```
+
+验证失败时不保存为 `active`，或保存为 `error` 状态并记录错误码。
+
+为什么要问：
+无验证机制时，用户容易保存无效模型配置，真正调用时才失败，体验会很差。
+
+你的回答：采取你的建议
+
+
+### 问题 19.2：ProviderConf 是否在 V1 就预留多凭证结构？
+
+通俗解释：
+同一个 provider 或同一个 base_url 可能有多个 API key，比如不同账号、不同额度、不同用途。你的自定义模型想法里提到每个 key 可以有一个 `slug`，请求时可指定使用哪个 key，并支持后续成本隔离和故障切换。
+
+建议：
+V1 数据结构应正式预留多凭证，但实现可以先只默认使用 `default`：
+
+```text
+credentials:
+  - slug: default
+    api_key_env: OPENAI_API_KEY
+    credential_ref: null
+    enabled: true
+    status: active
+
+route candidate:
+  provider_conf_id
+  credential_slug
+  model
+```
+
+内置 provider 可以先走 `api_key_env`；用户自定义 provider 后续走本地加密 `credential_ref`。即使 V1 不做完整多账号 UI，路由、日志、熔断和错误码也要按 `credential_slug` 预留字段。
+
+为什么要问：
+如果现在只把 key 做成 ProviderConf 的单个字段，后续加多 key / 多租户 / 配额隔离时会反复改路由和日志结构。
+
+你的回答：采取你的建议，V1就需要做多凭证结构
+
+
+### 问题 19.3：非 OpenAI-compatible 协议在 V1 做到什么程度？
+
+通俗解释：
+你的想法里提到 Anthropic、Gemini、非标准 API 都可以通过适配器接入。但它们的请求/响应格式和 OpenAI Chat Completions 不完全一样，如果 V1 全部做完，会显著扩大范围。
+
+建议：
+V1 明确分层：
+
+```text
+正式实现:
+  openai-compatible
+
+配置和枚举预留:
+  anthropic-compatible
+  gemini-compatible
+  custom-mapping
+
+暂不完整实现:
+  非标准请求体 JSON Path 映射
+  Anthropic/Gemini 原生协议完整 adapter
+```
+
+也就是说，Claude 如果通过 OpenAI-compatible 网关或 OpenRouter 接入，V1 可以支持；如果直接走 Anthropic Messages API，V1 先预留 provider variant，后续再做。
+
+为什么要问：
+这能避免 Models V1 被“所有模型协议全兼容”拖住，同时不破坏未来扩展路线。
+
+你的回答：V1 正式实现 OpenAI-compatible。
+anthropic-compatible 和 gemini-compatible 先进入协议枚举和配置预留，后续再实现原生 adapter。
+如果 Claude / Gemini 通过 OpenRouter 等 OpenAI-compatible 网关接入，则 V1 可以先支持。
+OpenAI-compatible      = 按 OpenAI 风格发请求
+anthropic-compatible   = 按 Claude / Anthropic 风格发请求
+gemini-compatible      = 按 Gemini / Google 风格发请求
+
+
+### 问题 19.4：自定义 Request Body / Response JSON Path 映射是否放到 V2？
+
+通俗解释：
+有些模型服务不是 OpenAI-compatible，可能要求把 `messages` 改成 `inputs`，把返回内容从某个特殊 JSON 路径取出来。你的想法里称为高级模式。
+
+建议：
+V1 先不实现完整模板引擎，只预留配置字段：
+
+```text
+request_mapping
+response_mapping
+headers
+protocol = custom-mapping
+```
+
+V1 的验收重点仍是 OpenAI-compatible 自定义模型。自定义映射属于高扩展能力，适合等 Runtime/API/Session 层和安全层更完整后再做。
+
+为什么要问：
+请求映射能力很强，但也带来安全、测试和错误诊断复杂度。先预留字段可以保证架构不堵死，但不会影响 V1 小步推进。
+
+你的回答：采取你的建议，就是说这个情况只在调用一些私有的模型时协议混乱的时候才会遇到，所以V1暂时不考虑这个，因为一般都使用那种公有的模型那种使用正常协议和字段的模型
+
+
+---
+
+## 5. 模型路由
+
+### 问题 20：是否需要模型路由，而不是全局只用一个模型？
+
+建议：
+需要。不同任务对模型要求不同：
+
+```text
+Analyzer fallback: 便宜、稳定、JSON 能力好
+Planner LLM: 结构化规划能力强
+ReAct action decision: JSON 稳定、遵循 schema 能力强
+call_model/respond: 回答质量好
+summary: 便宜、上下文长
+embedding: 专门 embedding 模型
+```
+
+为什么要问：
+如果所有场景都用一个模型，要么成本高，要么结构化输出不稳定。
+
+你的回答：需要，既然都说了可以更换和添加自定义模型那我最终肯定需要可以灵活的更改模型的
+
+
+### 问题 21：路由配置是否按调用类型配置？
+
+建议：
+使用 `routes.json`：
+
+```json
+{
+  "react_action_decision": [
+    {
+      "provider_conf_id": "conf_openai_default",
+      "model": "gpt-4o-mini",
+      "credential_slug": "default"
+    },
+    {
+      "provider_conf_id": "conf_qianwen_default",
+      "model": "qwen-plus",
+      "credential_slug": "default"
+    }
+  ],
+  "summary": [
+    {
+      "provider_conf_id": "conf_my_deepseek",
+      "model": "deepseek-chat",
+      "credential_slug": "default"
+    }
+  ],
+  "embedding": [
+    {
+      "provider_conf_id": "conf_openai_default",
+      "model": "text-embedding-3-small",
+      "credential_slug": "default"
+    }
+  ]
+}
+```
+
+列表含义是路由候选。候选不仅包含 provider 和 model，还包含运行时配置和凭证引用：
+
+```text
+provider_conf_id
+credential_slug
+model
+```
+
+这样可以支持：
+
+```text
+同一 provider 多个 key
+同一 base_url 多个模型
+用户自定义模型
+fallback / failover
+后续 round robin
+```
+
+为什么要问：
+这决定路由是代码硬编码还是配置驱动。
+
+你的回答：采取你的建议
+
+
+### 问题 22：如果主路由模型失败，是否自动切到 fallback 模型？
+
+建议：
+V1 支持可配置 fallback，但要保守：
+
+```text
+missing_api_key -> 可 fallback
+timeout -> 可 fallback
+rate_limited -> 可 fallback
+server_error -> 可 fallback
+schema_invalid -> 先 repair，再视情况 fallback
+blocked_by_policy -> 不 fallback
+invalid_prompt -> 不 fallback
+```
+
+如果启用多候选路由，建议区分冷却粒度：
+
+```text
+401 / 403
+  -> 冷却当前 credential_slug
+
+404 / 429 / 5xx / timeout / network_error
+  -> 冷却当前 provider_conf_id + model
+
+schema_invalid
+  -> 先 repair，再视情况切换候选
+```
+
+为什么要问：
+fallback 可以提升稳定性，但不能掩盖系统错误或安全阻断。
+
+你的回答：同意，fallback 就是模型调用失败后的备用模型/备用路由切换策略。V1 支持可配置 fallback，但必须按错误类型保守处理，不能用 fallback 掩盖安全阻断或请求本身错误。
+适合 fallback：
+missing_api_key：当前模型没配置 key，换一个已配置的
+timeout：当前模型超时，换一个
+rate_limited：当前模型限流，换一个
+server_error：当前模型服务端故障，换一个
+schema_invalid：模型返回 JSON 不合格，先 repair，修不好再考虑换
+等等...
+
+
+### 问题 23：模型路由是否需要记录实际使用了哪个 provider/model？
+
+建议：
+必须记录到 `ModelCallResult` 和日志：
+
+```text
+requested_route
+selected_provider
+selected_model
+fallback_used
+fallback_reason
+```
+
+为什么要问：
+没有这些字段，成本和问题定位会很困难。
+
+你的回答：需要，采取你的建议
+
+
+### 问题 24：是否允许用户在单轮请求中指定模型？
+
+示例：
+
+```text
+这次用 OpenAI 回答
+这个任务用便宜模型就行
+```
+
+建议：
+V1 不建议让普通自然语言直接绕过路由策略，例如用户随口说“这次用某个付费模型”就立即切换。但应支持通过明确配置入口选择已启用模型：
+
+```text
+配置文件 / API 参数 / 未来模型管理 UI
+  -> 选择 provider_conf_id / route / model
+```
+
+也就是说：
+
+```text
+允许用户在模型管理入口添加和启用自定义模型。
+允许运行时通过显式参数选择已启用模型或 route。
+不建议 V1 让 Analyzer 从普通聊天文本中自由切换 provider。
+```
+
+为什么要问：
+这影响权限、成本和模型稳定性。
+
+你的回答：采取你的建议，用户不能在输入文字里面控制使用哪个模型，所以都应该按照模型路由配置的规矩来，本次对话使用什么模型全在于用户通过模型路由配置给出的模型列表里面选择哪个模型就使用哪个模型
+
+
+### 问题 24.1：后续是否按“日常模型切换”和“模型管理”两个入口设计？
+
+通俗解释：
+你的自定义模型想法里提到类似 Cursor / OpenRouter 的体验：主界面只做快速选择已启用模型；专门的管理入口负责添加、验证、启用、禁用、搜索和筛选模型。
+
+建议：
+认可这个方向，但 V1 Models 层只做后端基础，不做完整 UI：
+
+```text
+Models V1 提供:
+  ProviderSpec / ProviderConf 数据结构
+  enabled/status/verified_at 字段
+  verify_provider_config()
+  list_enabled_models()
+  list_provider_configs()
+
+Runtime/API/Session 后续提供:
+  /model 快速切换已启用模型
+  /manage-models 添加、验证、启用、禁用和搜索模型
+```
+
+为什么要问：
+如果后续 UI 要分两个入口，Models 层现在就需要把“已启用模型”和“全部可管理 provider 配置”区分清楚。
+
+你的回答：采取你的建议，注意：V1先做完整的后端支持，后续前端UI直接调用相关接口用户就可以通过点击来进行模型管理和日常对话中的模型切换了
+
+
+---
+
+## 6. 结构化输出与 JSON repair
+
+### 问题 25：Models 层是否需要提供通用 `generate_json()`？
+
+建议：
+需要。Analyzer LLM fallback、Planner LLM planner、ReActExecutor ActionPacket 都需要 JSON 输出。通用接口可以做：
+
+```text
+调用模型
+提取 JSON object / array
+基础 JSON 解析
+按 schema 做轻量校验
+失败时构造通用 repair prompt
+返回 StructuredModelResult
+```
+
+但 ActionPacket 的业务校验仍留在 ReActExecutor。
+
+为什么要问：
+这决定 JSON 解析逻辑是继续散落在 Analyzer / Planner / ReActExecutor，还是逐步抽到 Models 层复用。
+
+你的回答：采取你的建议，第一阶段：Models 层做通用 JSON 处理，第二阶段：ReActExecutor 做 ActionPacket 业务校验和执行翻译
+Models 层：把模型输出解析成 JSON
+ReActExecutor：判断这个 JSON 是不是可执行的 ActionPacket
+ReActExecutor 不是直接翻译成 shell 命令，而是把 JSON 校验成 ActionPacket，再通过 Tool 层执行。
+
+
+
+### 问题 26：通用 JSON 解析应该宽松还是严格？
+
+当前现状：
+- Analyzer / Planner 支持从 fenced JSON 或带说明文字中提取 JSON。
+- ReActExecutor 主路径对 ActionPacket 更严格，不接受“自然语言夹 JSON”作为可执行动作。
+
+建议：
+Models 层提供两种模式：
+
+```text
+strict_json: 只接受纯 JSON object/array 或完整 fenced JSON
+lenient_json: 可从自然语言中提取第一个 JSON object/array
+```
+
+ReActExecutor ActionPacket 默认用 strict；Analyzer / Planner 可按场景使用 lenient。
+
+为什么要问：
+结构化动作越靠近执行器，越不能靠猜。
+
+你的回答：采取你的建议，Prompt 规定模型应该返回某种 JSON
+  -> 模型返回文本
+  -> Models 层提取 / 解析 / 修复 / 基础校验 JSON
+  -> 返回 StructuredModelResult
+  -> 上层再做业务语义校验
+
+
+### 问题 27：JSON repair 最大次数应由 Models 层统一配置，还是各调用方自己配置？
+
+建议：
+两级配置：
+
+```text
+Models 默认 max_json_repair_attempts
+调用方可覆盖，例如 ReActExecutor 使用 max_action_packet_repair_attempts
+```
+
+为什么要问：
+Analyzer、Planner、ReActExecutor 对 repair 成本和风险的容忍度不同。
+
+你的回答：采取你的建议
+
+
+### 问题 28：结构化输出失败时，Models 层返回什么？
+
+建议：
+返回：
+
+```python
+StructuredModelResult(
+    success=False,
+    parsed=None,
+    raw_text="...",
+    errors=["no JSON object found"],
+    repair_attempts=2,
+    model_result=ModelCallResult(...)
+)
+```
+
+不要把失败伪装成 `{}` 或默认成功结构。
+
+为什么要问：
+上层需要明确知道是模型没给 JSON，而不是任务本身失败。
+
+你的回答：采取你的建议（再重试指定次数后如果还是没有得到正确的json就需要这样做）
+
+
+### 问题 29：是否需要支持 JSON Schema 校验库？
+
+建议：
+V1 可先实现轻量 schema 校验，不强依赖 `jsonschema` 包；如果后续 schema 复杂，再加入依赖。
+
+为什么要问：
+新增依赖会影响 requirements 和测试环境，轻量校验足够支撑 V1 早期。
+
+你的回答：采取的建议
+
+
+### 问题 30：ActionPacket repair 逻辑是否迁移到 Models 层？
+
+建议：
+不迁移业务逻辑。Models 层只提供通用 repair 能力；ReActExecutor 继续负责：
+
+```text
+ActionPacket 枚举
+当前 step_id
+可用工具
+retry 限制
+安全策略
+字段级业务校验
+```
+
+为什么要问：
+ActionPacket 是执行器协议，不是通用模型协议。迁移太多会让 Models 层耦合执行器。
+
+你的回答：采取你的建议
+
+
+---
+
+## 7. ReActExecutor 模型交互专项
+
+### 问题 31：ReActExecutor ActionPacket 决策是否走专门 route？
+
+建议：
+是。新增调用类型：
+
+```text
+react_action_decision
+react_action_repair
+```
+
+这类 route 的默认模型应优先选择 JSON 稳定、指令遵循能力强的模型，而不是最会写长文的模型。
+
+为什么要问：
+ActionPacket 输出不稳定会直接影响执行闭环。
+
+你的回答：采取你的建议，用户选定的模型作为默认模型，所有内部模型调用默认使用该模型。
+react_action_decision 和 react_call_model 仍然区分为不同 route，
+但 route 默认只区分调用类型和参数，不自动切换模型。
+只有在配置中明确指定时，才允许不同任务使用不同模型。
+注意，这里专门的route不是指的更换模型，而是指使用用一个模型，只不过使用另外一套调用策略参数，比如温度，k-top这样的参数进行修改
+
+
+### 问题 32：ReActExecutor `call_model` 中间结果是否和 ActionPacket 决策使用同一个模型？
+
+建议：
+可配置分离：
+
+```text
+react_action_decision -> 结构化决策模型
+react_call_model -> 内容生成模型
+```
+
+为什么要问：
+执行决策和内容生成不是同一类任务。
+
+你的回答：采取你的建议，可以采取不同的模型调用策略参数或者其他配置（当然使用的模型还是用户选择的那个模型，比如用户开启本次对话前选择的事gpt5.5，那整个agent的模型调用都使用gpt5.5只不过可以使用不同的模型参数配置和提示词配置）
+
+
+### 问题 33：模型返回的 `thought_summary` 是否可以展示给用户？
+
+背景：
+ReActExecutor 文档已经明确 `thought_visible` 不是隐藏思维链，只能展示整理后的用户可见进度说明。
+
+建议：
+Models 层不负责决定展示。provider 原始输出进入执行器后，由 ReActExecutor 根据 `user_visible_message` 或整理后的事件决定展示内容。Models 层只负责不把完整 prompt / raw response 误写入用户事件。
+
+为什么要问：
+避免 Models 层把模型长推理或内部字段直接暴露给用户。
+
+你的回答：采取你的建议，反正模型层只管把返回的内容给执行器或者Planner，由其他层汇总需要再UI交互界面展示的思考、过程描述、执行描述等文字，模型层只负责提供稳定的交互和模型管理切换等核心底座服务即可
+
+
+### 问题 34：模型输出中如果包含 Observation 字段，执行器是否应忽略？
+
+建议：
+是。模型可以写 `expected_observation`，但不能写真实 Observation。真实 Observation 只能由 ReActExecutor 根据 Tool / Model / User / Control 结果生成。
+
+为什么要问：
+这是当前架构安全不变量之一。
+
+你的回答：采取你的建议
+
+
+### 问题 35：Models 层是否需要识别并阻止模型直接要求执行 shell？
+
+建议：
+Models 层不做业务阻断，只可在结构化结果中标记风险；真正阻断由 ReActExecutor 和 Tools / SafetyPolicy 做。Models 层不要解析自然语言命令并执行任何动作。
+
+为什么要问：
+ReActExecutor 不直接执行 shell，命令必须走 Tool 层。Models 层更不能执行 shell。
+
+你的回答：采取你的建议，还是前面提到的模型层只做属于他的工作
+
+
+---
+
+## 8. 流式输出与用户事件
+
+### 问题 36：Models V1 是否需要保留 `stream_generate()`？
+
+建议：
+保留，但第一阶段重点不是 UI 流式，而是结构化调用稳定性。`stream_generate()` 先服务普通文字生成；ActionPacket 决策默认仍用非流式完整 JSON，避免半截 JSON 解析问题。
+
+为什么要问：
+ReActExecutor 已经有 `execute_stream()` 用户事件流；这和 provider token streaming 是两层不同的流。
+
+你的回答：采取你的建议
+
+
+### 问题 37：provider token streaming 是否要直接暴露给用户事件流？
+
+建议：
+不要直接暴露。Models 层输出 token chunk；ReActExecutor / Runtime 决定哪些 chunk 变成 `message_delta` 或内部事件。
+
+为什么要问：
+用户事件和开发日志已经分离，Models 层不能越过执行层直接面向用户。
+
+你的回答：采取你的建议
+
+
+### 问题 38：结构化输出是否允许流式？
+
+建议：
+V1 不做结构化 JSON 流式解析。ActionPacket、Planner JSON、Analyzer JSON 都等完整响应后解析。
+
+为什么要问：
+流式 JSON 解析复杂且容易产生半截结构，V1 不值得引入。
+
+你的回答：模型输出的结构化json还是不要做流式了，免得解析出错，直接使用非流式得到完整的json再做解析处理
+
+
+---
+
+## 9. 错误码与失败分类
+
+### 问题 39：Models 层是否需要统一错误码？
+
+建议：
+需要。建议 V1 至少包含：
+
+```text
+missing_api_key
+missing_model_config
+unsupported_provider
+provider_not_enabled
+request_timeout
+rate_limited
+authentication_failed
+permission_denied
+network_error
+provider_server_error
+invalid_request
+context_length_exceeded
+model_call_failed
+empty_response
+json_parse_failed
+json_schema_invalid
+json_repair_exhausted
+route_unavailable
+circuit_open
+```
+
+为什么要问：
+ReActExecutor / Planner / Runtime 后续需要基于错误码做 retry、fallback、ask_user 或 fail。
+
+你的回答：需要，采取你的建议，除了你列出来的以外如果还有请在设计的时候补上
+
+
+### 问题 40：哪些错误允许 retry？
+
+建议允许 retry：
+
+```text
+request_timeout
+rate_limited
+network_error
+provider_server_error
+empty_response
+model_call_failed
+```
+
+不建议 retry：
+
+```text
+missing_api_key
+authentication_failed
+permission_denied
+unsupported_provider
+invalid_request
+context_length_exceeded
+json_schema_invalid
+```
+
+JSON schema 错误应先走 repair，不是简单重发同一个 prompt。
+
+为什么要问：
+这影响稳定性策略和成本。
+
+你的回答：采取你的建议，如果是因为一些不稳定的因素比如模型接口稳定性，返回的格式问题等等因素造成的就需要重试，因为一些原则性的原因导致的问题像没有秘钥或者秘钥过期失效（一般秘钥失效没用这种模型返回的结果里面应该会提到，这种需要agent进行决策直接判断为原则性错误）这种一看就知道肯定会失败的就不需要重试了
+
+
+### 问题 41：模型调用失败是否要进入 ReActExecutor Observation？
+
+建议：
+是，但 Observation 仍由 ReActExecutor 创建。Models 层返回结构化失败结果，ReActExecutor 将其转成真实 Observation。
+
+为什么要问：
+模型调用也是一种真实 action 结果，必须被 Checker 和 ExecutionResult 消费。
+
+你的回答：采取你的建议
+
+
+---
+
+## 10. 超时、重试、熔断、限流
+
+### 问题 42：每次模型调用是否必须有 timeout？
+
+建议：
+必须有 provider 默认 timeout，也允许调用方覆盖。
+
+示例：
+
+```text
+default_timeout_seconds = 30
+react_action_decision timeout = 20
+summary timeout = 60
+embedding timeout = 30
+```
+
+为什么要问：
+没有 timeout，Agent 执行会卡死在外部模型服务上。
+
+你的回答：采取你的建议，不过不管是哪种timeout至少大于40s，增加超时判定时间
+
+
+### 问题 43：retry 由 Models 层做，还是由 ReActExecutor 做？
+
+建议：
+模型服务调用层面的 retry 由 Models 层做，默认最多 5 次并使用指数级退避；ActionPacket schema repair、工具动作 retry 仍由 ReActExecutor 做。
+
+区分：
+
+```text
+Models retry: timeout / 429 / 5xx / network_error / provider_server_error
+ReActExecutor repair: 模型返回 JSON 不合法
+ReActExecutor retry_step: 工具或动作执行失败后的业务重试
+```
+
+Models retry 耗尽后返回：
+
+```python
+ModelCallResult(
+    success=False,
+    code="model_call_failed",
+    attempts=5
+)
+```
+
+为什么要问：
+不同 retry 语义不同，混在一起会让日志和成本无法解释。
+
+你的回答：采取你的建议，模型层面的超时或者其他非原则性失败由模型层重新向模型发送请求，指定次数后依然失败直接返回失败结构化数据给调用方，然后调用方做处理（记录日志，提示用户等等）如果是工具或者命令执行失败那这个就由执行层去重试了
+
+
+### 问题 44：是否需要熔断机制？
+
+通俗解释：
+如果一个 provider / credential / model 连续失败，短时间内不再反复调用同一个失败候选，直接走下一个路由候选或返回结构化失败。
+
+建议：
+V1 做轻量内存熔断，并区分冷却粒度：
+
+```text
+401 / 403:
+  当前 credential_slug 进入冷却
+
+404:
+  当前 provider_conf_id + model 进入冷却
+
+429:
+  当前 provider_conf_id + model 或 credential_slug 进入冷却，按 provider 返回信息判断
+
+5xx / timeout / network_error:
+  当前 provider_conf_id + model 进入短冷却
+
+连续失败 N 次:
+  route candidate 标记 circuit_open
+
+health_check / verify 成功:
+  恢复候选
+```
+
+如果你想压缩 V1 范围，也可以先只预留接口，Step 3 再做。
+
+为什么要问：
+真实 provider 或用户自定义模型故障时，Agent 不应每一步都卡在同一个失败候选上；但也不应该因为一个 key 失效就禁用同 provider 下所有模型。
+
+你的回答：采取你的建议，但是你给的冷却粒度还需要细化一下，完善一下，基于这个雏形设计一个全面的冷却粒度方案，比如可能还会有其他的错误码、捕获关键错误信息(有些模型可能有自己的错误码或者错误消息，但是错误消息基本大差不差所以需要捕获一些错误消息来进行判断)
+
+
+### 问题 45：是否需要本地限流？
+
+建议：
+V1 可先做配置占位，不实现复杂限流。先记录 `rate_limited` 并支持 retry/fallback。
+
+为什么要问：
+限流和并发控制更适合 Runtime/API 层统一做，但 Models 层要能识别 provider 的 429。
+
+你的回答：采取你的建议
+
+
+---
+
+## 11. Token、成本、上下文长度
+
+### 问题 46：Models V1 是否需要 token 统计？
+
+建议：
+需要，但分两级：
+
+```text
+provider 返回 usage -> 直接记录
+provider 不返回 usage -> 记录 None，不强行估算
+```
+
+后续可加粗略估算器，但 V1 不必为了估算引入复杂 tokenizer。
+
+为什么要问：
+成本统计、上下文压缩和运行观测都依赖 token 信息。
+
+你的回答：采取你的建议
+
+
+### 问题 47：是否需要成本估算？
+
+建议：
+V1 可以支持配置化价格表，但成本字段允许为 None。
+
+```text
+pricing.json:
+  provider/model -> input_price_per_1k / output_price_per_1k
+```
+
+为什么要问：
+如果后续频繁跑 ReAct loop，没有成本可见性会很难控制。
+
+你的回答：成本估算就不需要了吧，毕竟这个也只是一个agent，成本监控我在模型接口提供方我可以查看成本消耗情况的
+
+
+### 问题 48：上下文超长时由谁负责压缩？
+
+建议：
+各层分工：
+
+```text
+Analyzer / Planner / ReActExecutor: 构造合适上下文和摘要
+Models 层: 根据 provider/model max_context_tokens 做最后长度检查，超限时返回 context_length_exceeded 或触发可配置截断
+Memory / RAG: 后续负责历史压缩和检索
+```
+
+Models 层不要擅自删除关键结构字段，除非调用方明确允许。
+
+为什么要问：
+模型层自动截断 prompt 可能破坏 ActionPacket 或计划上下文。
+
+你的回答：这个压缩可以交由模型来做，确保保留关键信息，历史信息也需要交给模型进行压缩，不然一个Session越到后面的对话如果需要依赖前面对话的结果的话这是就需要对前文历史进行压缩，所以这个上下文压缩后续问答我觉得有必要进行详细的设计，毕竟这个东西涉及到了我的agent是否有良好的记忆和联系上下文的功能，这个需要和记忆层联动，记忆层联合模型层共同做一个Session的上下文对话的压缩记忆，还有就是在执行器和Planner内部有些地方需要多次调用模型并且严重依赖前面模型执行结果、工具执行结果、执行器和各个任务执行状况的地方也需要设计压缩，比如设计一个阈值的那个文字超过后那就需要进行压缩了，所以这个上下文压缩功能有许多地方都可能会涉及
+
+
+### 问题 49：是否需要为不同路由设置 temperature / max_tokens？
+
+建议：
+需要。结构化任务低温，创作总结类可稍高。
+
+示例：
+
+```text
+react_action_decision: temperature=0.1, max_tokens=1200
+planner_structured_plan: temperature=0.1, max_tokens=2500
+summary: temperature=0.3, max_tokens=2000
+chat: temperature=0.5, max_tokens=2000
+```
+
+为什么要问：
+结构化输出稳定性和自然语言质量需要不同采样参数。
+
+你的回答：采取你的建议，这个不就是前面提到过的调用同一个模型（用户指定的），然后不同情况使用不同的调用策略吗
+
+
+---
+
+## 12. 日志、指标与隐私
+
+### 问题 50：Models 层是否需要独立日志文件？
+
+建议：
+需要：
+
+```text
+logs/models.log
+```
+
+格式建议 JSONL。
+
+为什么要问：
+Analyzer / Planner / ReActExecutor 已经有各自日志。模型调用需要单独可追踪，不能散落在执行器日志里。
+
+你的回答：需要必须的，采取你的建议
+
+
+### 问题 51：模型日志默认记录完整 prompt 吗？
+
+建议：
+默认不记录完整 prompt，只记录：
+
+```text
+prompt_length
+prompt_preview
+messages_count
+route
+provider
+model
+latency_ms
+success
+error/code
+usage
+```
+
+开发模式可配置开启完整 prompt，但必须脱敏。
+
+为什么要问：
+prompt 可能包含用户隐私、文件内容、API key、路径和执行上下文。
+
+你的回答：采取你的建议
+
+
+### 问题 52：模型原始响应是否完整写日志？
+
+建议：
+结构化短 JSON 可以完整记录；长文本只记录摘要、长度和 hash。`raw_response` 可保存在 `ModelCallResult` 内存对象，但日志默认不全量写。
+
+为什么要问：
+真实模型回复可能很长，且可能包含敏感内容。
+
+你的回答：结构化短 JSON 可以完整记录，长文本不需要记录摘要算了，毕竟摘要也需要调用模型来生成总结的，浪费token，反正像这种东西也会全量记录到历史对话记录里面的，所以没必要记录到日志里面，日志只需要记录一些这个长文本的简单信息即可，比如生成用时，长度等等
+
+
+### 问题 53：Models 层是否要统一脱敏敏感字段？
+
+建议：
+是。至少脱敏：
+
+```text
+api_key
+token
+password
+secret
+authorization
+cookie
+set-cookie
+client_secret
+access_key
+refresh_token
+```
+
+为什么要问：
+provider headers、请求参数和 prompt 里都可能出现敏感字段。
+
+你的回答：采取你的建议，就对你给出的这几个字段进行脱敏吧
+
+
+### 问题 54：是否需要记录 `request_id / trace_id`？
+
+建议：
+需要。Models 调用应接收上层传入的：
+
+```text
+source_trace_id
+plan_id
+execution_id
+task_id
+step_id
+packet_id
+```
+
+并生成自己的：
+
+```text
+model_request_id
+provider_request_id
+```
+
+为什么要问：
+一次执行 trace 需要串起 Analyzer -> Planner -> ReActExecutor -> Models。
+
+你的回答：采取你的建议
+
+
+---
+
+## 13. Health Check 与启动诊断
+
+### 问题 55：`health_check()` 返回 bool 够不够？
+
+当前状态：
+`BaseModel.health_check()` 返回 bool。
+
+建议：
+新增结构化：
+
+```python
+health_check(...) -> ModelHealthStatus
+```
+
+`ModelHealthStatus` 至少包含：
+
+```text
+healthy
+provider_conf_id
+provider
+protocol
+model
+configured
+missing_config
+latency_ms
+error
+code
+verified_at
+metadata
+```
+
+如果局部测试或旧代码确实需要 bool，可以由调用方显式读取 `status.healthy`，不要让 Models 层正式接口继续返回裸 bool。
+
+为什么要问：
+Runtime/API 层后续需要 `/health` 展示模型配置状态。
+
+你的回答：采取你的建议，原版的仅仅只返回bool太简单了，这样不好，这个不符合工程化思想
+
+
+### 问题 56：health check 是否真的调用外部 API？
+
+建议：
+分两级：
+
+```text
+config_check: 检查 key、base_url、model 是否配置
+live_check: 可选真实轻量请求
+```
+
+默认测试和本地启动只做 config_check，避免无意义消耗和网络阻塞。
+
+为什么要问：
+启动时真实调用 API 会变慢、耗费额度，并可能因网络失败影响本地开发。
+
+你的回答：Agent 启动时：
+  默认只做 config_check
+  不自动 live_check
+
+用户点击“验证模型” / Runtime/API 显式调用 verify 时：
+  做 live_check
+
+正式模型调用时：
+  如果配置没问题但真实调用失败，就返回结构化错误
+补充：
+health_check 默认用于启动诊断和状态展示，偏向 config_check；
+verify_provider_config 用于用户主动验证模型可用性，才执行 live_check。
+
+
+---
+
+## 14. MockModel 与测试策略
+
+### 问题 57：MockModel 是否继续作为默认模型？
+
+建议：
+是。默认 `mock` 保证无 API key 也能跑测试和主链路。
+
+为什么要问：
+当前 310 条测试依赖 fake/mock 模型，不应要求真实外部服务。
+
+你的回答：那就保留吧，开发验证阶段用的上，后续正式测试agent的时候那就需要切换到正式的模型了
+
+
+### 问题 58：MockModel 是否需要支持结构化响应？
+
+建议：
+需要。V1 可增强 MockModel，使其根据 prompt 或调用类型返回：
+
+```text
+普通文本
+Analyzer JSON
+Planner JSON
+ActionPacket JSON
+embedding 向量占位
+```
+
+但要谨慎，避免 MockModel 变成复杂业务模拟器。复杂场景仍用测试里的 SequenceModel / FakeModel。
+
+为什么要问：
+默认 mock 如果永远只返回占位文本，真实主链路无法演示结构化路径。
+
+你的回答：采取你的建议，反正你就把MockModel这个模拟模型当做真实的模型来看，模拟真实模型来提供模型服务，这样后续切换真实模型的时候就不会有那么多问题了，比如模型响应的结构json，响应的长文本啥的，都需要验证agent是否可以正常处理模型返回的东西
+
+
+### 问题 59：真实 provider 集成测试是否默认跳过？
+
+建议：
+是。规则：
+
+```text
+无 API key -> skip
+未显式启用真实集成测试 -> skip
+有 key 且 RUN_MODEL_INTEGRATION_TESTS=true -> 执行
+```
+
+为什么要问：
+避免本地和 CI 被网络、额度、模型波动影响。
+
+你的回答：同意。真实 provider 集成测试默认跳过，只有配置了对应 API key 且显式设置 RUN_MODEL_INTEGRATION_TESTS=true 时才运行。普通单元测试和 CI 默认使用 mock/fake model，不访问真实外部模型 API。（仅限开发阶段的验证测试，等到agent完整开发完毕进行系统测试时那就需要使用真实模型了）
+
+
+### 问题 60：Models V1 单元测试优先覆盖哪些？
+
+建议优先覆盖：
+
+```text
+配置加载和 env 覆盖
+provider 缺 key 不崩溃
+generate / stream_generate 统一返回结构化结果
+generate / stream_generate 成功 / 失败状态传播
+Analyzer / Planner / ReActExecutor / legacy Executor 调用方适配
+调用方必须先判断 success，再消费 content
+缺配置 / 缺 key / 未启用 provider 返回明确错误码，不静默 mock
+ProviderSpec / ProviderConf 加载、字段校验和 provider_conf_id 显式绑定
+自定义 OpenAI-compatible provider 配置加载
+多凭证 credential_slug 选择和默认凭证选择
+enabled / status / verified_at 状态过滤
+不同调用类型 route 的参数策略，例如 temperature、top_p、max_tokens、json mode
+模型路由选择
+fallback 路由
+fallback 不处理 blocked_by_policy / invalid_prompt / user_cancelled
+熔断冷却粒度：credential、provider_conf_id + model、route candidate
+JSON strict / lenient 解析
+JSON repair 耗尽
+generate_json 返回 StructuredModelResult，并保留原始错误信息
+ActionPacket 业务校验不进入 Models 层，只做通用 JSON/schema 校验
+timeout / 5 次指数退避 retry 策略
+只对可重试错误 retry，不对 missing_api_key / invalid_prompt 重试
+日志脱敏
+logs/models.log JSONL 字段完整性
+prompt 默认不全量写日志，只记录长度、preview 或 hash
+request_id / trace_id / provider_request_id 传播
+health_check 结构化状态
+config_check 不访问外部 API
+verify_provider_config live_check 可被显式触发，失败时返回结构化状态
+MockModel 结构化输出
+MockModel 不伪装真实 provider，不掩盖真实配置错误
+embedding 接口返回结构化 EmbeddingResult / EmbeddingBatchResult
+真实 provider 集成测试默认 skip，只有 key + RUN_MODEL_INTEGRATION_TESTS=true 才运行
+```
+
+为什么要问：
+这决定 Models 层步骤文档里的验收顺序。
+
+你的回答：采取你的建议
+
+
+---
+
+## 15. Embedding 模型分离
+
+### 问题 61：Models V1 是否纳入 embedding 模型接口？
+
+背景：
+后续 Memory / RAG 层需要 embedding model 与 chat model 分离。
+
+建议：
+V1 先定义接口和配置，不急着替换 RAG 全链路：
+
+```python
+embed_text(text: str) -> EmbeddingResult
+embed_texts(texts: list[str]) -> EmbeddingBatchResult
+```
+
+为什么要问：
+RAG 层后续增强依赖模型层先给出 embedding provider 边界。
+
+你的回答：采取你的建议，先纳入吧，后续联动记忆和RAG再进行详细的配置和处理
+
+
+### 问题 62：Mock embedding 如何实现？
+
+建议：
+继续使用确定性 hash / 简单向量作为测试占位，但明确它不代表语义检索质量。
+
+为什么要问：
+测试需要稳定，不依赖真实 embedding；但文档不能把 hash embedding 误描述成真实 RAG 能力。
+
+你的回答：采取你的建议，模拟真实的embedding的功能
+
+
+### 问题 63：embedding 路由和 chat 路由是否完全分离？
+
+建议：
+是。配置中明确：
+
+```text
+DEFAULT_CHAT_MODEL
+DEFAULT_STRUCTURED_MODEL
+DEFAULT_EMBEDDING_MODEL
+```
+
+为什么要问：
+embedding 模型和 chat 模型参数、价格、输出结构完全不同。
+
+你的回答：采取你的建议，完全分离
+
+
+---
+
+## 16. 安全与权限边界
+
+### 问题 64：Models 层是否允许模型 provider 访问本地文件或执行代码？
+
+建议：
+不允许。Models 层只发送调用方传入的 prompt/messages，不主动读文件、不执行代码、不访问 Tool 层。
+
+为什么要问：
+ReActExecutor 规定命令必须走 Tool 层，Models 层必须保持纯模型服务边界。
+
+你的回答：采取你的建议
+
+
+### 问题 65：发送给外部模型的内容是否需要安全策略？
+
+建议：
+V1 先做基础脱敏和日志控制，不做完整数据出境策略。后续安全与权限层统一时，再实现外部 provider 发送策略。
+
+可预留字段：
+
+```text
+allow_external_provider
+sensitive_content_policy
+redact_before_send
+```
+
+为什么要问：
+文件内容、代码和用户隐私可能被发给外部模型，后续需要可控。
+
+你的回答：采取你的建议，先做基础脱敏和日志控制，可预留字段你看着办，尽量详细一些吧
+
+
+### 问题 66：当任务含有 API key、密码、隐私内容时，Models 层是否自动脱敏 prompt？
+
+建议：
+V1 不默认改写业务 prompt，避免破坏任务；但日志必须脱敏。是否发送敏感内容给外部模型，后续交给安全策略层判断。
+
+为什么要问：
+自动脱敏 prompt 可能导致模型无法完成用户明确要求的任务，但完全不管又有隐私风险。
+
+你的回答：采取你的建议
+
+
+---
+
+## 17. V1 开发范围
+
+### 问题 67：你是否认可 Models V1 的完成标准？
+
+建议 Models V1 完成标准：
+
+```text
+1. 以 ModelCallResult / StructuredModelResult / ModelHealthStatus 等结构化协议作为正式主接口。
+2. `generate()` / `stream_generate()` 本身返回结构化结果，不返回裸字符串或错误字符串。
+3. Analyzer / Planner / ReActExecutor / legacy Executor 的模型调用统一迁移为消费结构化结果，调用方必须先判断 success，再读取 content。
+4. 新增 config/models 配置中心，V1 正式配置不再依赖旧 `MODEL_NAME`。
+5. 配置中心区分 ProviderSpec 静态能力注册和 ProviderConf 运行时配置，并通过 provider_conf_id 显式绑定，不靠模型名称隐式推断 provider。
+6. 支持内置 provider 和用户自定义 provider 的统一配置模型。
+7. OpenAI-compatible 作为 V1 正式实现的默认协议基线，Qianwen / 自托管 / 第三方兼容端点优先走该协议。
+8. anthropic-compatible / gemini-compatible / custom-mapping 只进入协议枚举和配置预留，V1 不完整实现原生 adapter 或自定义映射模板引擎。
+9. provider 参数统一：provider、protocol、provider_conf_id、model、endpoint/base_url、api_key_env / credential_ref、timeout、temperature、top_p、max_tokens。
+10. 真实模型缺配置时返回结构化失败；只有显式配置 mock 时才使用 MockModel，不静默降级。
+11. OpenAI / Qianwen / Doubao provider 都通过统一接口创建，缺 key 不导致 Agent 启动崩溃，真实调用时返回 missing_api_key 等明确错误码。
+12. 支持自定义 OpenAI-compatible provider 的配置结构和 verify_provider_config 接口。
+13. 支持多凭证数据结构：route candidate 使用 provider_conf_id + credential_slug + model，默认可先使用 default 凭证。
+14. 支持调用类型 route：Analyzer、Planner、ReAct decision、call_model、summary、embedding 等。
+15. 用户选定模型作为默认模型；route 默认只区分调用类型和参数策略，不自动切换模型，只有配置明确指定时才允许不同任务使用不同模型。
+16. 支持不同 route 的调用参数策略，例如 temperature、top_p、max_tokens、json mode、timeout。
+17. 支持结构化 JSON 输出解析，区分 strict / lenient。
+18. 支持通用 JSON repair，业务校验仍留在调用方；ActionPacket 校验继续归 ReActExecutor。
+19. 支持模型调用 timeout、最多 5 次指数退避 retry、错误码分类、fallback provider 和轻量熔断冷却。
+20. fallback 按错误类型保守处理，不用 fallback 绕过 blocked_by_policy、invalid_prompt、user_cancelled 等错误。
+21. 支持基础 usage / latency / cost / request_id / trace_id / provider_request_id 记录。
+22. 支持 logs/models.log JSONL，默认不记录完整 prompt，敏感字段脱敏。
+23. 支持结构化 health_check，默认 config_check 不访问外部 API。
+24. 支持 verify_provider_config 显式 live_check，用于用户主动验证 base_url、key、model_id 和响应结构。
+25. MockModel 支持基本结构化响应和测试稳定性，但不伪装真实 provider，不掩盖真实配置错误。
+26. embedding 接口和配置先定义，真实替换可后续接 RAG 层。
+27. 有单元测试、调用方适配测试和可选真实 provider 集成测试；真实 provider 集成测试默认 skip，只有 key + RUN_MODEL_INTEGRATION_TESTS=true 才运行。
+28. 为后续 `/model` 快速切换和 `/manage-models` 管理入口预留 list/enable/status/verify 等模型管理基础接口。
+```
+
+为什么要问：
+这会直接成为后续 `Models层设计决策汇总.md` 和 `Models层开发步骤与进度.md` 的基线。
+
+你的回答：采取你的建议
+
+
+### 问题 68：你是否认可 Models V1 暂不做以下能力？
+
+建议 V1 暂不做：
+
+```text
+1. 不做复杂多 Agent 模型调度。
+2. 不做训练或微调。
+3. 不做完整 prompt 管理平台。
+4. 不做复杂成本预算和用户级额度系统。
+5. 不做完整数据出境审批系统，只预留安全字段。
+6. 不做异步 provider streaming 传输协议，只保留同步 generator。
+7. 不做复杂 tokenizer 精确计数，优先使用 provider usage。
+8. 不要求真实 provider 在无 key / 无网络环境下通过测试。
+9. 不把 ActionPacket 业务校验从 ReActExecutor 搬到 Models 层。
+10. 不让 Models 层直接调用工具、执行 shell 或生成 Observation。
+11. 不做完整模型管理 UI，只提供后续 Runtime/API/UI 可消费的配置、状态和 verify 接口。
+12. 不完整实现 Anthropic / Gemini 原生协议 adapter；V1 优先支持 OpenAI-compatible，其他协议先预留。
+13. 不实现完整自定义 Request Body / Response JSON Path 映射模板引擎，只预留字段。
+14. 不在 Models V1 实现完整安全与权限策略，只做日志脱敏、错误码和策略字段预留；是否允许发送敏感内容给外部模型交给后续安全与权限层统一处理。
+15. 不在 Models V1 实现完整模型管理 UI 或 Session 级持久化切换，只提供配置、状态、verify 和查询接口；具体交互放到 Runtime / API / Session 层。
+```
+
+为什么要问：
+这些能力重要，但如果放进 V1，会拖慢当前“让 Agent 真正可用”的外围支撑层推进。
+
+你的回答：采取你的建议
+
+
+### 问题 69：Models 层开发步骤是否按下面顺序推进？
+
+建议顺序：
+
+```text
+Step 1：模型调用协议底座
+  定义 ModelMessage、ModelCallOptions、ModelCallResult、StructuredModelResult、ModelHealthStatus、EmbeddingResult、错误码和调用类型枚举。
+
+Step 2：config/models 配置中心
+  定义 ProviderSpec、ProviderConf、RouteCandidate、credential_slug、enabled/status/verified_at，废弃旧 MODEL_NAME 正式入口。
+
+Step 3：结构化 generate / stream_generate 与调用方最小迁移
+  `generate()` / `stream_generate()` 改为结构化返回，并同步适配 Analyzer / Planner / ReActExecutor / legacy Executor，保证主链路不处于半破坏状态。
+
+Step 4：MockModel 结构化能力与基础 fixture
+  让无真实 key 的本地测试继续稳定运行，同时确保 MockModel 不掩盖真实 provider 配置错误。
+
+Step 5：OpenAI-compatible 统一适配器与内置 provider 配置化
+  OpenAI / Qianwen / Doubao / 自定义 OpenAI-compatible endpoint 走统一 adapter。
+
+Step 6：Provider health_check 与自定义模型 verify
+  health_check 默认 config_check；verify_provider_config 显式 live_check。
+
+Step 7：模型 route 与调用参数策略
+  支持按调用类型配置 temperature、top_p、max_tokens、json mode、timeout；用户选定模型默认不被 route 自动替换。
+
+Step 8：多候选、fallback、多凭证和轻量熔断
+  route candidate 使用 provider_conf_id + credential_slug + model，并按错误类型保守 fallback。
+
+Step 9：timeout / 最多 5 次指数退避 retry / 错误分类
+  只对 timeout、rate_limited、network_error、provider_server_error 等可重试错误 retry。
+
+Step 10：结构化 JSON 输出与 repair
+  实现 generate_json、strict/lenient JSON 解析和通用 repair；ActionPacket 业务校验仍留在 ReActExecutor。
+
+Step 11：usage / latency / cost / logs/models.log
+  记录 JSONL 模型调用日志、trace/request id、usage、latency、cost，默认不全量记录 prompt 并做敏感字段脱敏。
+
+Step 12：模型管理基础查询接口
+  为后续 `/model` 和 `/manage-models` 预留 list_enabled_models、list_provider_configs、状态查询和启用禁用基础能力。
+
+Step 13：embedding 接口和配置分离
+  定义 embed_text / embed_texts 结构化结果和 embedding route，真实 RAG 替换后续再接。
+
+Step 14：真实 provider opt-in 集成测试与 Models V1 验收
+  单元测试默认 mock/fake；真实 provider 测试只有 key + RUN_MODEL_INTEGRATION_TESTS=true 时执行。
+```
+
+为什么要问：
+这会直接写入 `src/models/Models层开发步骤与进度.md`。
+
+你的回答：
+
+
+---
+
+## 18. 真实使用偏好
+
+### 问题 70：你希望默认真实模型 provider 是哪一个？
+
+请填写：
+
+```text
+openai / qianwen / doubao / openai_compatible / 先继续 mock
+```
+
+建议：
+如果当前没有稳定 API key，默认继续 mock；真实 provider 通过配置启用。
+
+你的回答：gpt5.5吧，这个我有apikey：[REDACTED]
+然后这个模型调用的url是：https://api.43-161-200-52.sslip.io/v1
+这个地址是支持openai的接口
+
+
+### 问题 71：你最希望 Models 层优先支撑哪类真实任务？
+
+示例：
+
+```text
+ReActExecutor 稳定生成 ActionPacket
+Planner 生成复杂项目计划
+Analyzer 兜底识别意图
+普通聊天和总结质量
+RAG 文档问答
+代码开发任务中的模型辅助
+```
+
+建议：
+优先级应是：
+
+```text
+1. ReActExecutor ActionPacket
+2. Planner 结构化计划
+3. Analyzer 结构化兜底
+4. 普通 call_model / summary
+5. embedding / RAG
+```
+
+你的回答：采取你的建议
+
+
+### 问题 72：你有没有特别不希望 Models 层自动做的事情？
+
+例子：
+
+```text
+不要自动把敏感文件内容发给外部模型
+不要静默把失败包装成成功回答
+不要把完整 prompt 写日志
+不要让模型自由发明 ActionPacket 字段并执行
+不要在无确认情况下调用外部付费模型
+```
+
+你的回答：还有严格让模型按照ActionPacket协议来生成指挥命令，这样后续ActionPacket才可以直接将模型生成的东西直接给执行器使用，这样指挥效率会更高
+
+
+### 问题 73：你希望面试或介绍项目时怎么讲 Models 层？
+
+选项：
+
+```text
+A. 多模型 provider 适配层
+B. 模型服务网关
+C. 结构化模型调用层
+D. 支撑 ReActExecutor 的模型决策服务层
+E. 带路由、观测和稳定性策略的模型服务层
+```
+
+建议：
+可以组合讲：
+
+```text
+Models 层是带路由、结构化输出、错误封装和可观测能力的模型服务层，为 Analyzer、Planner 和 ReActExecutor 提供稳定的模型调用能力。
+```
+
+你的回答：采取你的建议
+
+
+---
+
+## 19. 其他补充
+
+### 问题 74：你对 Models 层还有哪些额外要求？
+
+可以补充：
+
+```text
+希望优先支持的模型
+本地模型需求
+代理 base_url
+企业网关
+成本限制
+日志保留策略
+隐私边界
+特殊模型参数
+```
+
+你的回答：隐私边界，特殊模型参数这两就行了吧，其他的后续迭代更新再做
+
+
+### 问题 75：本轮回答后，如果仍有不明确点，是否允许继续生成第二轮问题文档？
+
+建议：
+允许。Models 层涉及 provider、配置、结构化输出、稳定性、成本和 RAG，第一轮回答后可能还需要围绕具体 provider 或配置格式追问。
+
+你的回答：允许

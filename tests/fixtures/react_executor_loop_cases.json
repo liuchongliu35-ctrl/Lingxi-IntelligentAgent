@@ -1,0 +1,549 @@
+[
+  {
+    "id": "loop_single_tool_success",
+    "description": "model selects one calculator tool",
+    "model_responses": [
+      "{\"action_type\":\"call_tool\",\"action_target\":\"math_calculator\",\"action_args\":{\"expression\":\"2+3\"}}"
+    ],
+    "plan": {
+      "goal": "calculate",
+      "steps": [
+        {"id": "step_1", "description": "Calculate.", "step_type": "tool", "tool_name": "math_calculator", "args": {"expression": "2+3"}}
+      ]
+    },
+    "expect": {
+      "status": "completed",
+      "success": true,
+      "error_code": null,
+      "tool_call_count": 1,
+      "model_call_count": 1,
+      "step_statuses": {"step_1": "completed"},
+      "observations": {"count": 1, "successes": [true]},
+      "events_include": ["observation_created", "step_completed"],
+      "log_record_types_include": ["execution_started", "action_decision_prompt", "model_action_output", "action_packet", "observation", "checker_result", "transition_decision", "execution_finished"]
+    }
+  },
+  {
+    "id": "loop_multistep_input_from",
+    "description": "model selects read then summarize",
+    "model_responses": [
+      "{\"action_type\":\"call_tool\",\"action_target\":\"document_parser\",\"action_args\":{\"file_path\":\"README.md\"}}",
+      "{\"action_type\":\"call_tool\",\"action_target\":\"text_processor\",\"action_args\":{\"operation\":\"summary\"}}"
+    ],
+    "plan": {
+      "goal": "read and summarize",
+      "steps": [
+        {"id": "step_1", "description": "Read.", "step_type": "tool", "tool_name": "document_parser", "args": {"file_path": "README.md"}, "output_key": "doc"},
+        {"id": "step_2", "description": "Summarize.", "step_type": "tool", "tool_name": "text_processor", "args": {"operation": "summary"}, "input_from": ["doc"], "output_key": "summary"}
+      ]
+    },
+    "expect": {
+      "status": "completed",
+      "success": true,
+      "error_code": null,
+      "tool_call_count": 2,
+      "model_call_count": 2,
+      "step_statuses": {"step_1": "completed", "step_2": "completed"},
+      "observations": {"count": 2, "successes": [true, true]},
+      "events_include": ["step_completed", "observation_created"],
+      "log_record_types_include": ["action_decision_prompt", "action_packet", "observation", "checker_result", "transition_decision", "execution_finished"]
+    }
+  },
+  {
+    "id": "loop_multistep_output_key_write",
+    "description": "model selects read summarize and write in order",
+    "model_responses": [
+      "{\"action_type\":\"call_tool\",\"action_target\":\"document_parser\",\"action_args\":{\"file_path\":\"README.md\"}}",
+      "{\"action_type\":\"call_tool\",\"action_target\":\"text_processor\",\"action_args\":{\"operation\":\"extract\"}}",
+      "{\"action_type\":\"call_tool\",\"action_target\":\"file_writer\",\"action_args\":{\"file_path\":\"out.txt\"}}"
+    ],
+    "plan": {
+      "goal": "extract and write",
+      "steps": [
+        {"id": "step_1", "description": "Read.", "step_type": "tool", "tool_name": "document_parser", "args": {"file_path": "README.md"}, "output_key": "doc"},
+        {"id": "step_2", "description": "Extract.", "step_type": "tool", "tool_name": "text_processor", "args": {"operation": "extract"}, "input_from": ["doc"], "output_key": "extract"},
+        {"id": "step_3", "description": "Write.", "step_type": "tool", "tool_name": "file_writer", "args": {"file_path": "out.txt"}, "input_from": ["extract"]}
+      ]
+    },
+    "expect": {
+      "status": "completed",
+      "success": true,
+      "error_code": null,
+      "tool_call_count": 3,
+      "model_call_count": 3,
+      "step_statuses": {"step_1": "completed", "step_2": "completed", "step_3": "completed"},
+      "observations": {"count": 3, "successes": [true, true, true]},
+      "events_include": ["step_completed"],
+      "log_record_types_include": ["action_decision_prompt", "action_packet", "observation", "checker_result", "transition_decision", "execution_finished"]
+    }
+  },
+  {
+    "id": "loop_chat_finish",
+    "description": "chat mode is completed by a finish packet",
+    "model_responses": [
+      "{\"action_type\":\"finish\",\"final_answer\":\"chat answer\"}"
+    ],
+    "plan": {
+      "goal": "chat",
+      "mode": "chat",
+      "steps": [
+        {"id": "step_1", "description": "Respond.", "step_type": "respond"}
+      ]
+    },
+    "expect": {
+      "status": "completed",
+      "success": true,
+      "error_code": null,
+      "tool_call_count": 0,
+      "model_call_count": 1,
+      "step_statuses": {"step_1": "completed"},
+      "observations": {"count": 1, "successes": [true]},
+      "events_include": ["final_answer", "step_completed"],
+      "log_record_types_include": ["action_decision_prompt", "model_action_output", "action_packet", "observation", "checker_result", "transition_decision", "execution_finished"]
+    }
+  },
+  {
+    "id": "loop_call_model_then_finish",
+    "description": "model generates an intermediate answer then finishes the next step",
+    "model_responses": [
+      "{\"action_type\":\"call_model\",\"action_args\":{\"goal\":\"summarize\",\"input\":\"source text\",\"output_requirements\":\"short\"}}",
+      "intermediate summary",
+      "{\"action_type\":\"finish\",\"final_answer\":\"final summary\"}"
+    ],
+    "plan": {
+      "goal": "summarize and finish",
+      "steps": [
+        {"id": "step_1", "description": "Summarize.", "step_type": "model", "expected_output": "summary", "output_key": "summary"},
+        {"id": "step_2", "description": "Finish.", "step_type": "respond"}
+      ]
+    },
+    "expect": {
+      "status": "completed",
+      "success": true,
+      "error_code": null,
+      "tool_call_count": 0,
+      "model_call_count": 3,
+      "step_statuses": {"step_1": "completed", "step_2": "completed"},
+      "observations": {"count": 2, "successes": [true, true]},
+      "events_include": ["message_delta", "final_answer", "step_completed"],
+      "log_record_types_include": ["model_prompt", "model_action_output", "action_packet", "observation", "checker_result", "transition_decision", "execution_finished"]
+    }
+  },
+  {
+    "id": "loop_invalid_json_repair_success",
+    "description": "invalid model output is repaired into a tool action",
+    "model_responses": [
+      "not valid json",
+      "{\"action_type\":\"call_tool\",\"action_target\":\"math_calculator\",\"action_args\":{\"expression\":\"2+3\"}}"
+    ],
+    "plan": {
+      "goal": "repair",
+      "steps": [
+        {"id": "step_1", "description": "Calculate.", "step_type": "tool", "tool_name": "math_calculator", "args": {"expression": "2+3"}}
+      ]
+    },
+    "expect": {
+      "status": "completed",
+      "success": true,
+      "error_code": null,
+      "tool_call_count": 1,
+      "model_call_count": 2,
+      "step_statuses": {"step_1": "completed"},
+      "observations": {"count": 1, "successes": [true]},
+      "events_include": ["observation_created", "step_completed"],
+      "log_record_types_include": ["action_packet_repair", "model_action_output", "action_packet", "observation", "checker_result", "transition_decision", "execution_finished"]
+    }
+  },
+  {
+    "id": "loop_invalid_json_repair_exhausted",
+    "description": "invalid model output remains invalid after repair",
+    "model_responses": [
+      "not valid json",
+      "still not valid json"
+    ],
+    "config": {"max_action_packet_repair_attempts": 1},
+    "plan": {
+      "goal": "repair exhausted",
+      "steps": [
+        {"id": "step_1", "description": "Calculate.", "step_type": "tool", "tool_name": "math_calculator", "args": {"expression": "2+3"}}
+      ]
+    },
+    "expect": {
+      "status": "failed",
+      "success": false,
+      "error_code": "action_packet_invalid",
+      "tool_call_count": 0,
+      "model_call_count": 2,
+      "step_statuses": {"step_1": "failed"},
+      "observations": {"count": 1, "codes_include": ["action_packet_invalid"], "successes": [false]},
+      "events_include": ["step_failed"],
+      "log_record_types_include": ["action_packet_repair", "model_action_output", "observation", "checker_result", "transition_decision", "execution_finished"]
+    }
+  },
+  {
+    "id": "loop_unknown_tool_repair_to_replan",
+    "description": "unknown tool is repaired into request_replan",
+    "model_responses": [
+      "{\"action_type\":\"call_tool\",\"action_target\":\"unknown_tool\",\"action_args\":{\"query\":\"topic\"}}",
+      "{\"action_type\":\"request_replan\",\"request_replan_reason\":\"unknown tool contract\"}"
+    ],
+    "plan": {
+      "goal": "unknown tool",
+      "steps": [
+        {"id": "step_1", "description": "Search.", "step_type": "tool", "tool_name": "math_calculator", "args": {"expression": "2+3"}}
+      ]
+    },
+    "expect": {
+      "status": "request_replan",
+      "success": false,
+      "error_code": "request_replan",
+      "request_replan": true,
+      "tool_call_count": 0,
+      "model_call_count": 2,
+      "step_statuses": {"step_1": "failed"},
+      "observations": {"count": 1, "codes_include": ["request_replan"], "successes": [false]},
+      "events_include": ["request_replan"],
+      "log_record_types_include": ["action_packet_repair", "model_action_output", "action_packet", "observation", "checker_result", "transition_decision", "execution_finished"]
+    }
+  },
+  {
+    "id": "loop_tool_failure_retry_success",
+    "description": "temporary tool failure is retried by the checker",
+    "model_responses": [
+      "{\"action_type\":\"call_tool\",\"action_target\":\"math_calculator\",\"action_args\":{\"expression\":\"2+3\"}}"
+    ],
+    "tool_results": {
+      "math_calculator": [
+        {"success": false, "message": "temporary timeout", "code": "command_timeout"},
+        {"success": true, "data": "5", "message": "5"}
+      ]
+    },
+    "plan": {
+      "goal": "retry",
+      "steps": [
+        {"id": "step_1", "description": "Calculate.", "step_type": "tool", "tool_name": "math_calculator", "args": {"expression": "2+3"}, "retryable": true, "max_retries": 2}
+      ]
+    },
+    "expect": {
+      "status": "completed",
+      "success": true,
+      "error_code": null,
+      "tool_call_count": 2,
+      "model_call_count": 1,
+      "step_statuses": {"step_1": "completed"},
+      "observations": {"count": 2, "successes": [false, true]},
+      "events_include": ["retry_scheduled", "retry_finished"],
+      "log_record_types_include": ["retry_decision", "model_action_output", "observation", "checker_result", "transition_decision", "execution_finished"]
+    }
+  },
+  {
+    "id": "loop_tool_failure_retry_exhausted",
+    "description": "retry budget exhaustion fails the step",
+    "model_responses": [
+      "{\"action_type\":\"call_tool\",\"action_target\":\"math_calculator\",\"action_args\":{\"expression\":\"2+3\"}}"
+    ],
+    "tool_results": {
+      "math_calculator": [
+        {"success": false, "message": "timeout", "code": "command_timeout"},
+        {"success": false, "message": "still timeout", "code": "command_timeout"}
+      ]
+    },
+    "plan": {
+      "goal": "retry exhausted",
+      "steps": [
+        {"id": "step_1", "description": "Calculate.", "step_type": "tool", "tool_name": "math_calculator", "args": {"expression": "2+3"}, "retryable": true, "max_retries": 1}
+      ]
+    },
+    "expect": {
+      "status": "failed",
+      "success": false,
+      "error_code": "command_timeout",
+      "tool_call_count": 2,
+      "model_call_count": 1,
+      "step_statuses": {"step_1": "failed"},
+      "observations": {"count": 2, "successes": [false, false]},
+      "events_include": ["retry_scheduled", "retry_exhausted"],
+      "log_record_types_include": ["retry_decision", "model_action_output", "observation", "checker_result", "transition_decision", "execution_finished"]
+    }
+  },
+  {
+    "id": "loop_tool_failure_fallback_model",
+    "description": "tool failure falls back to model reasoning",
+    "model_responses": [
+      "{\"action_type\":\"call_tool\",\"action_target\":\"primary_tool\",\"action_args\":{\"query\":\"topic\"}}",
+      "model recovered"
+    ],
+    "tool_results": {
+      "primary_tool": [
+        {"success": false, "message": "primary failed", "code": "file_exists"}
+      ]
+    },
+    "plan": {
+      "goal": "fallback model",
+      "steps": [
+        {"id": "step_1", "description": "Run primary.", "step_type": "tool", "tool_name": "primary_tool", "args": {"query": "topic"}, "allow_model_reasoning": true}
+      ]
+    },
+    "expect": {
+      "status": "completed",
+      "success": true,
+      "error_code": null,
+      "tool_call_count": 1,
+      "model_call_count": 2,
+      "step_statuses": {"step_1": "completed"},
+      "observations": {"count": 2, "successes": [false, true]},
+      "events_include": ["fallback_started", "fallback_finished"],
+      "log_record_types_include": ["fallback_decision", "model_action_output", "observation", "checker_result", "transition_decision", "execution_finished"]
+    }
+  },
+  {
+    "id": "loop_tool_failure_fallback_tool",
+    "description": "tool failure falls back to a registered tool",
+    "model_responses": [
+      "{\"action_type\":\"call_tool\",\"action_target\":\"primary_tool\",\"action_args\":{\"query\":\"topic\"}}"
+    ],
+    "tool_results": {
+      "primary_tool": [
+        {"success": false, "message": "primary failed", "code": "file_exists"}
+      ],
+      "fallback_tool": [
+        {"success": true, "data": "fallback data", "message": "fallback ok"}
+      ]
+    },
+    "plan": {
+      "goal": "fallback tool",
+      "steps": [
+        {"id": "step_1", "description": "Run primary.", "step_type": "tool", "tool_name": "primary_tool", "args": {"query": "topic"}, "fallback_tools": ["fallback_tool"]}
+      ]
+    },
+    "expect": {
+      "status": "completed",
+      "success": true,
+      "error_code": null,
+      "tool_call_count": 2,
+      "model_call_count": 1,
+      "step_statuses": {"step_1": "completed"},
+      "observations": {"count": 2, "successes": [false, true]},
+      "events_include": ["fallback_started", "fallback_finished"],
+      "log_record_types_include": ["fallback_decision", "model_action_output", "observation", "checker_result", "transition_decision", "execution_finished"]
+    }
+  },
+  {
+    "id": "loop_command_confirmation_approved",
+    "description": "command action pauses and resumes after approval",
+    "execution_mode": "context_resume",
+    "model_responses": [
+      "{\"action_type\":\"call_tool\",\"action_target\":\"command_tool\",\"action_args\":{\"command\":\"python --version\",\"cwd\":\".\",\"purpose\":\"diagnostic\",\"risk_level\":\"low\",\"requires_confirmation\":true,\"expected_result\":\"command completes successfully\",\"timeout_seconds\":5}}"
+    ],
+    "resume": {"approved": true, "reason": "approved for fixture"},
+    "plan": {
+      "goal": "command",
+      "available_tools": ["command_tool"],
+      "steps": [
+        {"id": "step_1", "description": "Run command.", "step_type": "tool", "tool_name": "command_tool", "args": {}}
+      ]
+    },
+    "expect": {
+      "status": "completed",
+      "success": true,
+      "error_code": null,
+      "tool_call_count": 1,
+      "model_call_count": 1,
+      "step_statuses": {"step_1": "completed"},
+      "observations": {"count": 2, "successes": [false, true]},
+      "events_include": ["confirmation_requested", "command_finished"],
+      "log_record_types_include": ["model_action_output", "action_packet", "observation", "checker_result", "transition_decision"]
+    }
+  },
+  {
+    "id": "loop_command_confirmation_rejected",
+    "description": "command action is cancelled after user rejection",
+    "execution_mode": "context_resume",
+    "model_responses": [
+      "{\"action_type\":\"call_tool\",\"action_target\":\"command_tool\",\"action_args\":{\"command\":\"python --version\",\"cwd\":\".\",\"purpose\":\"diagnostic\",\"risk_level\":\"low\",\"requires_confirmation\":true,\"expected_result\":\"command completes successfully\",\"timeout_seconds\":5}}"
+    ],
+    "resume": {"approved": false, "reason": "user rejected"},
+    "plan": {
+      "goal": "command reject",
+      "available_tools": ["command_tool"],
+      "steps": [
+        {"id": "step_1", "description": "Run command.", "step_type": "tool", "tool_name": "command_tool", "args": {}}
+      ]
+    },
+    "expect": {
+      "status": "cancelled",
+      "success": false,
+      "error_code": "confirmation_rejected",
+      "tool_call_count": 0,
+      "model_call_count": 1,
+      "step_statuses": {"step_1": "cancelled"},
+      "observations": {"count": 2, "successes": [false, false]},
+      "events_include": ["confirmation_requested", "step_failed"],
+      "events_exclude": ["command_started"],
+      "log_record_types_include": ["model_action_output", "action_packet", "observation", "checker_result", "transition_decision"]
+    }
+  },
+  {
+    "id": "loop_model_request_replan",
+    "description": "model directly requests a revised plan",
+    "model_responses": [
+      "{\"action_type\":\"request_replan\",\"request_replan_reason\":\"selected tool is no longer valid\"}"
+    ],
+    "plan": {
+      "goal": "replan",
+      "steps": [
+        {"id": "step_1", "description": "Replan.", "step_type": "respond"}
+      ]
+    },
+    "expect": {
+      "status": "request_replan",
+      "success": false,
+      "error_code": "request_replan",
+      "request_replan": true,
+      "tool_call_count": 0,
+      "model_call_count": 1,
+      "step_statuses": {"step_1": "failed"},
+      "observations": {"count": 1, "codes_include": ["request_replan"], "successes": [false]},
+      "events_include": ["request_replan"],
+      "log_record_types_include": ["model_action_output", "action_packet", "observation", "checker_result", "transition_decision", "execution_finished"]
+    }
+  },
+  {
+    "id": "loop_max_step_turns_blocked",
+    "description": "step turn limit blocks a repeatedly failing action",
+    "model_responses": [
+      "{\"action_type\":\"call_tool\",\"action_target\":\"math_calculator\",\"action_args\":{\"expression\":\"2+3\"}}"
+    ],
+    "tool_results": {
+      "math_calculator": [
+        {"success": false, "message": "timeout", "code": "command_timeout"}
+      ]
+    },
+    "config": {"max_step_turns": 1},
+    "plan": {
+      "goal": "turn limit",
+      "steps": [
+        {"id": "step_1", "description": "Calculate.", "step_type": "tool", "tool_name": "math_calculator", "args": {"expression": "2+3"}, "retryable": true, "max_retries": 5}
+      ]
+    },
+    "expect": {
+      "status": "failed",
+      "success": false,
+      "error_code": "max_turns_reached",
+      "tool_call_count": 1,
+      "model_call_count": 1,
+      "step_statuses": {"step_1": "failed"},
+      "observations": {"count": 1, "successes": [false]},
+      "events_include": ["step_failed"],
+      "log_record_types_include": ["model_action_output", "observation", "checker_result", "transition_decision", "execution_finished"]
+    }
+  },
+  {
+    "id": "loop_partial_failed_independent_later_step",
+    "description": "failed task unit does not prevent an independent later task unit",
+    "model_responses": [
+      "{\"action_type\":\"call_tool\",\"action_target\":\"document_parser\",\"action_args\":{\"file_path\":\"first.md\"}}",
+      "{\"action_type\":\"call_tool\",\"action_target\":\"math_calculator\",\"action_args\":{\"expression\":\"2+3\"}}"
+    ],
+    "tool_results": {
+      "document_parser": [
+        {"success": false, "message": "first task failed", "code": "action_failed"}
+      ]
+    },
+    "plan": {
+      "goal": "partial independent",
+      "task_units": [
+        {"id": "task_1", "title": "First task", "step_ids": ["step_1"]},
+        {"id": "task_2", "title": "Independent later task", "step_ids": ["step_2"]}
+      ],
+      "steps": [
+        {"id": "step_1", "task_id": "task_1", "description": "Read first document.", "step_type": "tool", "tool_name": "document_parser", "args": {"file_path": "first.md"}},
+        {"id": "step_2", "task_id": "task_2", "description": "Calculate.", "step_type": "tool", "tool_name": "math_calculator", "args": {"expression": "2+3"}}
+      ]
+    },
+    "expect": {
+      "status": "partial_failed",
+      "success": false,
+      "error_code": null,
+      "tool_call_count": 2,
+      "model_call_count": 2,
+      "step_statuses": {"step_1": "failed", "step_2": "completed"},
+      "observations": {"count": 2, "successes": [false, true]},
+      "events_include": ["step_failed", "step_completed"],
+      "log_record_types_include": ["model_action_output", "observation", "checker_result", "transition_decision", "execution_finished"]
+    }
+  },
+  {
+    "id": "loop_finish_action",
+    "description": "finish action completes a normal plan",
+    "model_responses": [
+      "{\"action_type\":\"finish\",\"final_answer\":\"done\"}"
+    ],
+    "plan": {
+      "goal": "finish",
+      "steps": [
+        {"id": "step_1", "description": "Finish.", "step_type": "respond"}
+      ]
+    },
+    "expect": {
+      "status": "completed",
+      "success": true,
+      "error_code": null,
+      "tool_call_count": 0,
+      "model_call_count": 1,
+      "step_statuses": {"step_1": "completed"},
+      "observations": {"count": 1, "successes": [true]},
+      "events_include": ["final_answer", "step_completed"],
+      "log_record_types_include": ["model_action_output", "action_packet", "observation", "checker_result", "transition_decision", "execution_finished"]
+    }
+  },
+  {
+    "id": "loop_missing_input_reference",
+    "description": "model action cannot resolve a missing input reference",
+    "model_responses": [
+      "{\"action_type\":\"call_tool\",\"action_target\":\"text_processor\",\"action_args\":{\"operation\":\"summary\",\"input_from\":[\"missing_output\"]}}"
+    ],
+    "plan": {
+      "goal": "missing input",
+      "steps": [
+        {"id": "step_1", "description": "Summarize.", "step_type": "tool", "tool_name": "text_processor", "args": {"operation": "summary"}}
+      ]
+    },
+    "expect": {
+      "status": "failed",
+      "success": false,
+      "error_code": "tool_input_ref_missing",
+      "tool_call_count": 0,
+      "model_call_count": 1,
+      "step_statuses": {"step_1": "failed"},
+      "observations": {"count": 1, "codes_include": ["tool_input_ref_missing"], "successes": [false]},
+      "events_include": ["step_failed"],
+      "log_record_types_include": ["model_action_output", "action_packet", "observation", "checker_result", "transition_decision", "execution_finished"]
+    }
+  },
+  {
+    "id": "loop_dangerous_command_blocked",
+    "description": "dangerous command is blocked before tool execution",
+    "model_responses": [
+      "{\"action_type\":\"call_tool\",\"action_target\":\"command_tool\",\"action_args\":{\"command\":\"rm -rf .\",\"cwd\":\".\",\"purpose\":\"destructive test\",\"risk_level\":\"blocked\",\"requires_confirmation\":true,\"expected_result\":\"never execute\",\"timeout_seconds\":5}}"
+    ],
+    "plan": {
+      "goal": "blocked command",
+      "available_tools": ["command_tool"],
+      "steps": [
+        {"id": "step_1", "description": "Run dangerous command.", "step_type": "tool", "tool_name": "command_tool", "args": {}}
+      ]
+    },
+    "expect": {
+      "status": "blocked",
+      "success": false,
+      "error_code": "safety_blocked",
+      "tool_call_count": 0,
+      "model_call_count": 1,
+      "step_statuses": {"step_1": "blocked"},
+      "observations": {"count": 1, "codes_include": ["safety_blocked"], "successes": [false]},
+      "events_include": ["step_failed"],
+      "log_record_types_include": ["model_action_output", "action_packet", "observation", "checker_result", "transition_decision", "execution_finished"]
+    }
+  }
+]

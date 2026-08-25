@@ -1,0 +1,1247 @@
+# Tools 设计问题回答（2）
+
+本文档是 Tools 层 V1 正式化的第二轮设计问答。
+
+第一轮 `Tools设计问题回答(1).txt` 已经确认了 Tools 层的大方向：Tools 层是项目级工具能力服务层，负责真实执行、结构化返回、权限边界、错误分类、日志审计，并通过统一 `ToolResult` 给 ReActExecutor 生成真实 `Observation`。模型不能直接执行工具，ReActExecutor 也不能绕过 Tool 层直接执行 shell。
+
+第二轮不再重复第一轮已经确定的大方向，重点确认会直接影响代码结构、配置格式、工具 schema、权限策略、MCP 接入和验收步骤的细节。
+
+当前已特别纳入考虑的 MCP 补充文档：
+
+```text
+src/tools/Tools层MCP工具设计方案.md
+```
+
+本轮需要重点确认的基础工具口径：
+
+```text
+阅读工具
+编辑工具
+终端工具
+联网搜索工具
+预览工具
+删除工具
+MCP 扩展工具
+```
+
+建议你继续在每个“你的回答：”后面填写答案。如果认可建议，可以写“采取你的建议”；如果想调整边界，直接写你的偏好。
+
+---
+
+## 1. 第一轮遗留冲突收束
+
+### 问题 1：如何修正“旧 Executor legacy 回退”这个文档级架构误解？
+
+背景：
+第一轮问题和部分总纲文档中曾把旧顺序 Executor 描述成 `legacy 回退`。这个说法存在架构误解：
+
+```text
+旧顺序 Executor 从未作为正式执行架构完成。
+项目目标已经明确转向 Planner-guided ReActExecutor。
+如果新 ReActExecutor 链路解决不了，旧顺序 Executor 更不可能作为可靠 fallback 解决。
+因此不能把旧 Executor 描述成“新链路失败时自动回退”的正式方案。
+```
+
+这个问题应作为 Tools V1 设计前必须修正的文档 bug。
+
+建议：
+正式修正为：
+
+```text
+1. 旧顺序 Executor 是早期原型/历史诊断参考，`legacy` 仅表示显式兼容/迁移开关，不是正式 fallback。
+2. 默认正式执行架构是 ReActExecutor。
+3. Tools V1 只对接 ReActExecutor 的结构化 ActionPacket 链路。
+4. 旧 ToolManager 旧执行逻辑不保留为第二套正式工具运行时。
+5. 如果代码里仍有 executor_type="legacy" 或 EXECUTOR_TYPE=legacy，只能视为历史诊断/迁移开关，后续可清理或保留为显式切换入口，不进入 Tools V1 的自动回退验收目标。
+```
+
+Tools 层后续修改方案：
+
+```text
+ReActExecutor
+  -> ToolRegistry
+  -> ToolManager / ToolRuntime
+  -> 真实 Tool
+  -> ToolResult
+  -> Observation
+```
+
+`ToolManager.run_tool` 这个方法名可以短期保留给当前代码迁移和测试调用，但它不代表旧 ToolManager 协议。它内部必须走新的 `ToolCallRequest / ToolRegistry / ToolPolicy / ToolResult` 协议。
+
+为什么要问：
+如果继续写“legacy 回退”，后续开发者会误以为 Tools V1 要同时兼容旧顺序 Executor 和新 ReActExecutor，导致维护两套执行链路。正确方向是：清理旧顺序执行架构的误导表述，Tools V1 直接服务新 ReActExecutor。
+
+你的回答：采取你的建议
+
+
+### 问题 2：Tools V1 是否把“阅读、编辑、终端、联网搜索、预览、删除、MCP”作为用户心智上的七个核心工具能力？
+
+建议：
+是。用户心智上可以按七个核心能力理解：
+
+```text
+阅读:
+  read_file / read_file_chunk / document_parser / file_info
+
+编辑:
+  write_file / edit_file 或 patch_file
+
+终端:
+  command_tool / shell_command_tool
+
+联网搜索:
+  web_search
+
+预览:
+  dry_run / preview event / confirmation preview
+
+删除:
+  delete_file
+
+MCP:
+  mcp.<server_id>.<tool_name>
+```
+
+注意：
+这里的“预览”不一定是一个独立 `preview_tool`。它更像 Tool 层和 ReActExecutor 共同支持的执行前预检查能力，作用是把“即将发生的副作用”先转换成用户和执行器都能审查的结构化信息。
+
+换句话说，preview 更像一种执行模式，不是一个必须单独暴露的大工具：
+
+```text
+普通执行:
+  直接调用工具产生真实副作用
+
+预览 / dry_run:
+  先不产生真实副作用，只返回影响范围、参数摘要、差异预览和风险说明
+```
+
+在整个 Agent 链路里，preview 的典型位置是：
+
+```text
+Analyzer
+  -> Planner
+  -> ReActExecutor
+  -> Tool(dry_run / preview)
+  -> Observation
+  -> 用户确认
+  -> Tool(真实执行)
+```
+
+它主要用于高风险或副作用明显的动作，例如：
+
+```text
+文件覆盖前先看 diff
+删除前先看将删除哪些路径
+命令执行前先看 cwd / 风险 / 可能写入删除联网的影响
+MCP 高风险工具调用前先看参数摘要和影响范围
+patch_file 局部编辑前先看命中位置和修改片段
+```
+
+不适合强行加 preview 的场景通常是：
+
+```text
+纯读取类动作
+计算类动作
+普通文本处理
+低风险 metadata 查询
+明显不会产生副作用的小工具
+```
+
+因此，preview 的工程角色不是“多一步执行”，而是“把高风险执行变成可审查、可确认、可审计的状态”。
+
+为什么要问：
+这决定后续文档、ToolSpec、用户可见事件和 UI/API 里怎么描述 Tools 层。
+
+你的回答：采取你的建议
+
+
+---
+
+## 2. 预览工具和 dry_run 边界
+
+### 问题 3：“预览工具”是否作为独立工具暴露给模型？
+
+背景：
+你把“预览”列为最重要的基础工具之一。但从工程实现看，预览可能有两种形态：
+
+```text
+A. 独立 preview_tool
+B. 每个高风险工具都支持 dry_run / preview
+```
+
+建议：
+V1 不把 `preview_tool` 作为模型正常调用的独立工具，而是把预览作为 `ToolCallOptions.dry_run=true` 和确认事件的一部分。
+
+示例：
+
+```text
+write_file + dry_run:
+  返回将写入哪个文件、是否覆盖、内容大小、diff preview。
+
+delete_file + dry_run:
+  返回将删除哪些文件、大小、路径、是否敏感。
+
+command_tool + dry_run:
+  返回命令、cwd、风险等级、可能写文件/联网/删除。
+
+mcp tool + dry_run:
+  返回将调用哪个 MCP server/tool、参数摘要、风险等级。
+```
+
+可以保留一个内部能力名：
+
+```text
+preview_action
+```
+
+但它不作为模型可见工具列表里的常规工具，主要由 ReActExecutor 在确认前自动触发。
+
+为什么要问：
+如果把预览做成独立工具，模型可能会生成“只预览不执行”的多余步骤，执行器还要维护预览结果和真实执行之间的一致性。把预览做成工具调用选项更稳定。
+
+你的回答：采取你的建议
+
+
+### 问题 4：预览结果是否必须进入用户可见 ExecutionEvent？
+
+建议：
+需要。所有 high risk 或需要确认的工具调用，在真实执行前应产生用户可见事件，先展示预览摘要，再等待用户确认：
+
+```text
+event_type: confirmation_required
+tool_name
+tool_category
+risk_level
+preview_summary
+target_paths
+estimated_effect
+requires_confirmation
+confirmation_id
+```
+
+预览事件只展示安全摘要，不展示完整敏感内容。它应该尽量回答三个问题：
+
+```text
+1. 这次会改什么 / 删什么 / 执行什么
+2. 风险大不大
+3. 用户确认后会发生什么
+```
+
+常见内容示例：
+
+```text
+write_file / patch_file:
+  目标文件、是否覆盖、diff preview、影响行数、是否敏感
+
+delete_file:
+  删除目标列表、是否包含敏感路径、是否仅 workspace 内
+
+command_tool / shell_command_tool:
+  command、cwd、风险等级、可能写入/删除/联网、超时
+
+mcp.*:
+  server_id、tool_name、参数摘要、risk_level、是否需要确认
+```
+
+这类事件通常由 ReActExecutor 自动插入到事件流里，用户点击确认后再进入真实工具执行。`preview` 本身不应默认替代最终执行结果，也不应直接泄露完整文件内容、完整 stdout/stderr 或完整远程响应。
+
+为什么要问：
+后续 Runtime / API / Session 层需要根据这些事件做“暂停、确认、继续执行”。
+
+你的回答：需要，采取你的建议
+
+
+---
+
+## 3. 权限、总授权和管理员权限
+
+### 问题 5：是否引入会话级权限开关，而不是每次都问？
+
+背景：
+你提到可以像 Codex / Trae 一样，让用户选择某些低风险操作自动执行，高风险再确认。
+
+建议：
+V1 支持会话级权限开关，但不做完整权限 UI。
+
+建议字段：
+
+```text
+allow_read_workspace: true
+allow_write_workspace: false
+allow_network: false
+allow_command: false
+allow_shell_command: false
+allow_mcp: false
+```
+
+默认策略：
+
+```text
+读取普通 workspace 文件:
+  可默认允许，敏感文件除外。
+
+新建普通 workspace 文件:
+  如果 allow_write_workspace=true，可自动执行。
+
+覆盖、patch、append:
+  如果 allow_write_workspace=true 且非敏感文件，可自动执行。
+  如果 false，则确认。
+
+命令执行:
+  默认确认，低风险命令可在 allow_command=true 后自动执行。
+
+复杂 shell:
+  默认确认，即使 allow_command=true 也要更严格。
+
+联网搜索:
+  受 allow_network 控制。
+
+MCP:
+  受 allow_mcp 和具体 MCP 工具风险控制。
+```
+
+为什么要问：
+这决定确认逻辑是在每个工具里零散判断，还是走统一 `ToolCallOptions` / policy。
+
+你的回答：是的，开启一个新会话只需要确认一次即可，后续所有对话都按照这个确认的结果来，可以采取你的建议
+
+
+### 问题 6：V1 是否真正支持管理员权限 / 工作区外访问？
+
+背景：
+你提到可以通过用户确认授予管理员权限，访问工作区外路径或执行需要管理员权限的命令。
+
+建议：
+V1 先不真正实现“管理员权限执行”。可以设计协议字段，但默认策略为：
+
+```text
+workspace_root 内:
+  按普通权限和风险等级执行。
+
+workspace_root 外:
+  默认 blocked 或 confirmation_required，但 V1 不实际放行写入和删除。
+
+需要系统管理员权限的命令:
+  V1 默认 blocked，返回 admin_permission_required。
+```
+
+原因：
+管理员权限不是一个普通确认按钮那么简单，它涉及：
+
+```text
+进程提权方式
+操作系统弹窗
+跨平台行为
+安全审计
+越权风险
+失败恢复
+```
+
+建议 V1 先把字段和错误码预留好：
+
+```text
+requires_admin: true
+admin_permission_required
+workspace_out_of_scope
+```
+
+等安全与权限层统一时再做真正管理员授权。
+
+为什么要问：
+如果 V1 就允许管理员权限，会明显扩大 Tools 层实现范围和安全风险。
+
+你的回答：可以，tool先把这块预留好，后续做安全与权限层在和这块对接，采取你的建议
+
+
+### 问题 7：风险等级 high 是否一定需要确认，blocked 是否永远不能通过确认放行？
+
+建议：
+是。
+
+```text
+low:
+  默认可执行，仍受 enabled / scope / timeout 限制。
+
+medium:
+  取决于会话权限和工具策略，可执行或确认。
+
+high:
+  默认需要用户确认。
+
+blocked:
+  直接拒绝，不进入确认流程。
+```
+
+blocked 示例：
+
+```text
+格式化磁盘
+关机重启
+删除 workspace 外路径
+递归删除目录
+读取或泄露明显密钥
+绕过 ToolRegistry 直接执行工具
+外部模型 provider 直接执行本地工具
+```
+
+为什么要问：
+这会成为 ToolPolicy 的核心不变量。
+
+你的回答：采取你的建议
+
+
+---
+
+## 4. 命令工具细节
+
+### 问题 8：普通 command_tool 的参数是否从字符串 command 改为 argv？
+
+背景：
+第一轮确认普通 `command_tool` 默认 `shell=False`，复杂 shell 元字符走 `shell_command_tool`。
+
+建议：
+普通 `command_tool` V1 采用结构化 argv：
+
+```json
+{
+  "program": "python",
+  "args": ["-m", "pytest", "tests/test_x.py"],
+  "cwd": ".",
+  "purpose": "运行指定测试",
+  "timeout_seconds": 30
+}
+```
+
+为了兼容旧 ActionPacket，可以短期支持：
+
+```json
+{
+  "command": "python -m pytest tests/test_x.py"
+}
+```
+
+但内部应解析为 argv；如果发现管道、重定向、`&&`、`;` 等复杂 shell 语法，则拒绝普通通道，并提示改用 `shell_command_tool`。
+
+为什么要问：
+argv 更容易校验和审计；字符串 command 更符合用户直觉但更难安全解析。
+
+你的回答：采取你的建议，内部应解析为 argv
+
+
+### 问题 9：shell_command_tool 是否在 V1 正式实现，还是只预留？
+
+建议：
+V1 实现最小可用版本，因为你希望终端能力尽量完整。
+
+V1 边界：
+
+```text
+允许管道、重定向、&&、; 等复杂 shell 语法。
+默认 high risk，需要确认。
+必须支持 timeout、cwd 限制、输出截断、日志审计。
+必须执行危险命令规则，blocked 命令不能通过确认放行。
+```
+
+不做：
+
+```text
+管理员提权
+交互式 TTY
+长时间后台服务托管
+任意工作区外破坏性操作
+```
+
+为什么要问：
+如果不做 shell 通道，用户很多真实开发命令会跑不起来；如果做得过宽，安全边界会变差。
+
+你的回答：采取你的建议，V1只要可以跑一些普通的指令比如编辑，创建文件，执行脚本等等指令就行了，可以正常跑完一个指令并给出正常反馈确保执行层可以正常执行下去就可以了，
+像管理员提权
+交互式 TTY
+长时间后台服务托管
+任意工作区外破坏性操作这些复杂的就不做了
+
+
+### 问题 10：删除命令是否继续在 command_tool 中拦截，统一改走 delete_file？
+
+建议：
+V1 继续拦截 `rm / del / erase / rmdir / rd` 等删除命令，普通文件删除走 `delete_file`。
+
+原因：
+删除放在 `delete_file` 中更容易做：
+
+```text
+workspace 检查
+文件和目录区分
+敏感路径判断
+dry_run 预览
+确认
+删除前元数据记录
+结构化 ToolResult
+```
+
+如果用户输入的是自然语言“删除 a.txt”，模型应生成：
+
+```text
+tool_name = "delete_file"
+```
+
+而不是生成命令行删除。
+
+为什么要问：
+这会影响命令安全矩阵和文件工具边界。
+
+你的回答：采取你的建议，还有就是用户没有提及删除某个文件，而是模型在规划步骤时发现需要做这一步的时候，这里模型给出的指令最好还是去调用这个删除工具去执行删除
+
+
+### 问题 11：命令输出是否保存完整 raw_output？
+
+建议：
+ToolResult 可以保留受控 raw_output 或 artifact_ref，但 Observation 和用户事件默认只放截断预览。
+
+建议：
+
+```text
+stdout_preview
+stderr_preview
+stdout_truncated
+stderr_truncated
+stdout_bytes
+stderr_bytes
+exit_code
+duration_ms
+artifact_ref 可选
+```
+
+完整输出不直接写入 `logs/tools.log`，日志只记录 hash、长度和预览。
+
+为什么要问：
+命令输出可能非常长，也可能包含密钥或路径隐私。
+
+你的回答：这是一个阈值，超过这个阈值就截断，没超过就保留完整 raw_output，至于这个阈值可以尽量设置的大一些，这样也就只有个别的命令的raw_output可能会截断，大部分的都会完整保留，因为正常的一般都是正常长度的，可以应付正常的情况即可
+
+
+---
+
+## 5. 文件阅读、编辑和删除细节
+
+### 问题 12：编辑工具正式命名为 write_file、edit_file 还是 patch_file？
+
+背景：
+第一轮已经确认 `write_file` 需要区分 create / overwrite / append / patch。但用户心智上“编辑”是高频工具。
+
+建议：
+V1 同时保留两层命名：
+
+```text
+write_file:
+  负责 create / overwrite / append 这类整体写入。
+
+edit_file 或 patch_file:
+  负责局部修改，包括替换、插入、删除。
+```
+
+建议正式工具名：
+
+```text
+write_file
+patch_file
+```
+
+原因：
+`patch_file` 更能表达“局部修改”，避免模型把整份文件覆盖当成普通编辑。
+
+为什么要问：
+这会影响 ToolSpec、ActionPacket、测试文件和 Planner 的工具选择。
+
+你的回答：可以，采取你的建议，write_file，patch_file这两工具名可以，这个只能说是类型吧，都属于是编辑工具
+
+
+### 问题 13：patch_file V1 支持哪种 patch 协议？
+
+建议：
+V1 不直接要求模型生成完整 unified diff，先支持结构化 patch blocks：
+
+```json
+{
+  "file_path": "src/app.py",
+  "patches": [
+    {
+      "operation": "replace",
+      "old_text": "a",
+      "new_text": "b",
+      "occurrence": 1
+    },
+    {
+      "operation": "insert_after",
+      "anchor": "def main():",
+      "text": "    print('hello')"
+    }
+  ]
+}
+```
+
+V1 支持：
+
+```text
+replace
+insert_before
+insert_after
+delete_block
+```
+
+V1 暂不做：
+
+```text
+复杂 AST patch
+跨文件事务
+自动格式化保证
+冲突自动合并
+```
+
+为什么要问：
+局部编辑是最高频能力之一，协议必须足够明确，不能靠自然语言猜“往哪里改”。
+
+你的回答：采取你的建议，还有一点就是如何精准定位需要修改哪一行或者哪几行的内容需要做定位设计，尤其是局部编辑这种，一定要定位精准，不然可能造成错误编辑
+
+
+### 问题 14：文件读取是否需要 read_file_chunk/head/tail 作为正式工具？
+
+建议：
+需要。第一轮已经确认按大小分等级读取，因此 V1 建议正式提供：
+
+```text
+read_file
+read_file_chunk
+read_file_head
+read_file_tail
+```
+
+默认：
+
+```text
+read_file:
+  小文件直接返回内容，超过阈值返回 file_too_large 和建议 chunk。
+
+read_file_chunk:
+  按 offset/line range 读取。
+
+read_file_head / read_file_tail:
+  快速查看文件开头或结尾。
+```
+
+为什么要问：
+这能避免把大文件一次性塞进 Observation，也能支持后续模型按需读取。
+
+你的回答：采取你的建议
+
+
+### 问题 15：文件修改前是否统一返回 diff preview？
+
+建议：
+对覆盖、append、patch、delete_file 都支持 dry_run preview。
+
+```text
+overwrite:
+  显示旧文件大小、新文件大小、hash、可选 diff preview。
+
+append:
+  显示追加位置、追加字节数、尾部 preview。
+
+patch:
+  显示命中的 anchor / old_text 次数、修改片段、影响行数。
+
+delete_file:
+  显示目标路径、大小、修改时间、是否敏感。
+```
+
+为什么要问：
+这会直接决定用户确认前看到什么，也影响测试验收。
+
+你的回答：可以采取你的建议
+
+
+### 问题 16：copy_file / move_file / rename_file 是否 V1 完整实现？
+
+建议：
+V1 实现，但风险等级按副作用处理：
+
+```text
+copy_file:
+  medium risk，workspace 内可按授权执行。
+
+move_file:
+  high risk，默认确认。
+
+rename_file:
+  high risk，默认确认。
+```
+
+原因：
+你希望编辑、阅读、删除等真实项目开发能力完整；复制、移动、重命名虽然使用频率低于读写，但属于文件管理闭环。
+
+为什么要问：
+这会影响 Step 5 的工作量。
+
+你的回答：采取你的建议
+
+
+### 问题 17：delete_file 是否支持批量文件列表？
+
+建议：
+V1 支持明确文件列表，不支持目录、递归和 glob 展开。
+
+允许：
+
+```json
+{
+  "file_paths": ["a.txt", "b.txt"]
+}
+```
+
+不允许：
+
+```text
+delete_directory
+recursive=true
+*.log
+**/*.tmp
+```
+
+如果模型传入 glob，应返回 `glob_delete_not_allowed`，提示需要先 `find_files` 得到明确文件列表，再请求用户确认。
+
+为什么要问：
+批量明确文件列表是有用的，但 glob 和目录递归风险更高。
+
+你的回答：采取你的建议
+
+
+---
+
+## 6. Observation 分级和上下文成本
+
+### 问题 18：observation_mode 由谁决定？
+
+建议：
+采用三层决策：
+
+```text
+ToolSpec 默认值:
+  每个工具定义默认 observation_mode。
+
+ActionPacket 请求值:
+  模型可以提出 minimal / standard / full。
+
+ReActExecutor 最终裁决:
+  根据安全、上下文预算、敏感路径和工具结果大小最终决定。
+```
+
+优先级：
+
+```text
+安全策略 > 上下文预算 > ReActExecutor 裁决 > ActionPacket 请求 > ToolSpec 默认
+```
+
+模型可以请求 full，但执行器可以降级为 standard 或 minimal。
+
+为什么要问：
+既保留模型灵活性，又避免模型把大内容和敏感信息无节制塞进上下文。
+
+你的回答：可以采取你的建议
+
+
+### 问题 19：Observation full 模式是否允许把全文直接放入模型上下文？
+
+建议：
+允许，但只在严格条件下：
+
+```text
+内容不敏感
+长度低于 max_observation_chars
+当前 step 后续确实需要全文
+ReActExecutor 判断上下文预算足够
+```
+
+否则应返回：
+
+```text
+standard preview + raw_ref / artifact_ref
+```
+
+模型后续如需更多内容，再调用 `read_file_chunk` 或专门读取工具。
+
+为什么要问：
+这个决定 token 成本和敏感信息边界。
+
+你的回答：采取你的建议
+
+
+### 问题 20：input_summary 是否可以由 ActionPacket 顺带提供，但不专门调用模型？
+
+建议：
+是。
+
+第一轮你已经明确不希望为了 `input_summary` 再单独调用模型。建议：
+
+```text
+ActionPacket.reason / purpose:
+  可作为 input_summary 来源之一。
+
+ToolManager:
+  使用规则生成参数摘要、长度、hash、目标路径。
+
+Models:
+  不为了 input_summary 单独调用。
+```
+
+为什么要问：
+这会写入 Tools 日志和 Observation 生成规则，避免额外 token 成本。
+
+你的回答：采取你的建议
+
+
+---
+
+## 7. 联网搜索细节
+
+### 问题 21：search_api 第一阶段是否优先 Tavily？
+
+背景：
+第一轮已经确认 search_api 和 model_builtin 都完整实现接口，真实测试默认 skip。此前讨论中建议 Tavily 作为第一 search_api provider，Brave 作为后续可选。
+
+建议：
+V1 search_api 首选 Tavily adapter。
+
+原因：
+
+```text
+Tavily 面向 Agent / RAG 场景
+返回结构化搜索结果比较方便
+比传统搜索页面抓取更适合工具层
+真实测试可通过环境变量和 API key 后置
+```
+
+V1 不依赖 Bing Search API 作为正式方案。
+
+为什么要问：
+这决定配置字段、fake provider 和真实 provider adapter 的名称。
+
+你的回答：是的，首选Tavily adapter这个第三方接口api做联网搜索
+
+
+### 问题 22：web_search 的 model_builtin provider 是否允许返回自然语言 summary 字段？
+
+建议：
+允许，但必须结构化包在 `WebSearchData` 内，并标注证据等级。
+
+建议字段：
+
+```text
+summary:
+  模型联网搜索返回的自然语言概述。
+
+results:
+  每条网页级结果，包含 title/url/snippet/source/published_at 可选。
+
+evidence_level:
+  url_verified | provider_reported | model_reported | no_url_summary
+
+source_quality:
+  verified_sources | partial_sources | summary_only
+```
+
+关键规则：
+
+```text
+有 URL 和来源:
+  可以作为可审计搜索结果。
+
+没有 URL，但模型给了联网总结:
+  工具可以 success=True，但必须 evidence_level=no_url_summary。
+  不能伪装成有来源的网页证据。
+```
+
+为什么要问：
+你第一轮认为没有 URL 的模型联网总结也可以消费，但需要标记。这里需要把“成功”和“可审计证据”分开。
+
+你的回答：可以，允许自然语言，需要告诉模型将这些包在结构字段中，这样后续就方便消费，采取你的建议
+
+
+### 问题 23：web_search 是否在 V1 做网页正文抓取？
+
+建议：
+不做完整网页正文抓取。V1 只做搜索结果和 provider 返回摘要。
+
+预留后续工具：
+
+```text
+fetch_url
+read_web_page
+browser_preview
+```
+
+原因：
+网页正文抓取涉及 robots、反爬、HTML 清洗、编码、脚本渲染、安全过滤和内容体积控制，最好后续单独设计。
+
+为什么要问：
+你希望 Agent 能参考网页解决问题，但 V1 可以先通过搜索结果摘要和模型步骤消费，不把网页抓取塞进 web_search。
+
+你的回答：可以，V1目前调用第三方api联网搜索时目前就只拿这些东西吧，但是用户需要可以不使用auto方案，可以优先使用模型来进行联网搜索，毕竟模型联网搜索出来的东西更全面，对于后续ReActExecutor或者Planner层做规划可以提供更多方案
+
+
+---
+
+## 8. MCP 扩展工具细节
+
+### 问题 24：MCP V1 是否纳入 Tools V1 正式范围？
+
+建议：
+纳入，但作为独立阶段实现，范围限制为：
+
+```text
+MCP Server 配置加载
+stdio / Streamable HTTP 连接
+tools/list 工具发现
+远程工具转换为 ToolSpec
+ToolRegistry 动态注册
+tools/call 统一调用
+ToolResult 归一化
+fake MCP Server 测试
+```
+
+暂不做完整 MCP 插件市场、资源系统、prompts、sampling 和复杂远程执行生态。
+
+为什么要问：
+你已经明确 MCP 执行工具是第七个核心能力，但它如果做太大，会拖慢 Tools V1 主目标。
+
+你的回答：采取你的建议，不做插件市场，但是需要可以自定义按照mcp工具的协议来添加自定义的mcp工具（你可以联网搜索一下添加一个自定义mcp工具需要哪些参数以及拿到这些参数后该提交给谁，然后怎么去执行，然后再去设计mcp执行工具）我记得好像前提需要安装Node.js的npx或者uv 和 uvx （这是 Python 生态中运行 MCP 服务器的核心工具）才可以跑mcp，这个你设计的时候去联网搜索一下相关实现方案，好像还有两种调用方式，一种时调用本地的mcp工具，使用STDIO方式，还有一种是调研外部的mcp工具需要使用流式HTTP来做
+STDIO（标准输入输出） 依赖于父子进程关系。Codex 是父进程，MCP 服务器是子进程，两者通过操作系统底层的管道通信。这只能在同一台电脑的同一个用户会话下生效，完全跨不了网络。
+HTTP/SSE 是基于网络请求的。只要外部服务器有一个 IP 地址或域名，并且开放了端口，Codex 就能通过网络请求去调用它。
+V1先实现STDIO方式调用本地的mcp工具吧，流式HTTP先不用做
+
+
+### 问题 25：MCP 工具对模型暴露独立工具名，还是只暴露 mcp_execute？
+
+建议：
+对模型暴露独立工具名：
+
+```text
+mcp.<server_id>.<tool_name>
+```
+
+底层统一走：
+
+```text
+MCPToolGateway
+```
+
+不建议让模型正常调用模糊的：
+
+```text
+mcp_execute
+```
+
+`mcp_execute` 可以保留为内部调试或兼容入口，但不是模型可见主要工具。
+
+为什么要问：
+独立 ToolSpec 才能让 Planner / ReActExecutor / ToolRegistry 明确知道工具描述、参数 schema、风险和确认策略。
+
+你的回答：当然需要对模型暴露根据名啊，不然模型怎么去指挥调用这个mcp工具呢，采取你的建议
+
+
+### 问题 26：MCP Server 的配置文件放在哪里？
+
+建议：
+放在 Tools 独立配置目录下：
+
+```text
+config/tools/mcp_servers.json
+```
+
+或后续统一配置中心里：
+
+```text
+config/tools/mcp/*.json
+```
+
+配置只保存：
+
+```text
+server_id
+display_name
+enabled
+transport
+command / args 或 url
+credential_ref
+allowed_tools
+default_risk_level
+timeout_seconds
+```
+
+不保存明文 API key、token 或密码。
+
+为什么要问：
+这会影响配置加载、测试 fixture 和后续用户添加 MCP 的 API。
+
+你的回答：采取你的建议
+
+
+### 问题 27：MCP 工具的风险等级如何决定？
+
+建议：
+远程 MCP 工具描述只能作为参考，最终风险等级由本地策略决定。
+
+默认：
+
+```text
+未知 MCP 工具:
+  medium risk
+
+名称或描述包含 create/update/write/send/post/publish:
+  high risk
+
+名称或描述包含 delete/remove/drop/pay/transfer/execute/shell:
+  blocked 或 high risk + 强确认，视具体策略
+```
+
+用户可在配置里覆盖：
+
+```text
+allowed_tools
+tool_policies
+```
+
+为什么要问：
+MCP 是外部扩展来源，不能完全信任远程工具自我描述。
+
+你的回答：采取你的建议
+
+
+### 问题 28：MCP 工具失败后是否允许模型自动改用命令行？
+
+背景：
+你之前提到 MCP 工具不可用时，很多 Agent 会改用命令行方案。
+
+建议：
+允许，但必须经过 ReActExecutor / Checker，而不是 Tool 层自己改用命令行。
+
+流程：
+
+```text
+MCP ToolResult success=False
+  -> ReActExecutor 生成 Observation
+  -> Checker 判断可 fallback_to_tool
+  -> 模型根据 Observation 重新生成 command_tool / shell_command_tool ActionPacket
+  -> 再走命令工具安全检查和确认
+```
+
+Tools 层不能自己把 MCP 调用失败“翻译成命令执行”。
+
+为什么要问：
+保持 Tools 层不越权，不变成第二个执行器。
+
+你的回答：允许，采取你的建议
+
+
+---
+
+## 9. ToolResult、事件和用户展示
+
+### 问题 29：ToolResult 中是否新增 tool_category 字段？
+
+背景：
+第一轮你提到希望有字段表示工具调用是哪一类，比如搜索、编辑、终端。
+
+建议：
+需要。
+
+建议字段：
+
+```text
+tool_name
+tool_category
+tool_namespace
+```
+
+示例：
+
+```text
+tool_name = "patch_file"
+tool_category = "edit"
+tool_namespace = "builtin"
+
+tool_name = "mcp.github.create_issue"
+tool_category = "mcp"
+tool_namespace = "mcp.github"
+```
+
+为什么要问：
+这会影响错误提示、用户可见事件、日志筛选和后续 UI 图标。
+
+你的回答：需要，采取你的建议
+
+
+### 问题 30：message 字段是否作为用户可见短消息，但不能承载完整结果？
+
+建议：
+是。
+
+```text
+message:
+  给用户或上层展示的短结果说明。
+
+data:
+  给程序消费的结构化结果。
+
+raw_output / artifact_ref:
+  给调试、后续读取或受控展示使用。
+```
+
+例子：
+
+```text
+message = "已修改 src/app.py，影响 3 行。"
+data = { file_path, edit_mode, changed_lines, diff_preview }
+```
+
+为什么要问：
+避免把完整 stdout、文件内容或搜索结果塞进 message。
+
+你的回答：采取你的建议
+
+
+### 问题 31：ExecutionEvent 是否只由 ReActExecutor 生成，Tool 层只提供 event_payload 建议？
+
+建议：
+是。
+
+Tools 层可以在 ToolResult.metadata 中提供：
+
+```text
+event_summary
+event_details
+preview_summary
+affected_resources
+```
+
+但正式 `ExecutionEvent` 仍由 ReActExecutor 生成。
+
+原因：
+用户事件要串联 PlanStep、Observation、Checker 和最终结果，Tool 层只知道自己的执行结果，不知道整个执行上下文。
+
+为什么要问：
+避免 Tools 层越界成输出反馈处理器。
+
+你的回答：采取你的建议
+
+
+---
+
+## 10. 配置和验收
+
+### 问题 32：Tools 配置是否分成 defaults、providers、policies、mcp 四类？
+
+建议：
+是。
+
+建议目录：
+
+```text
+config/tools/defaults.json
+config/tools/providers.json
+config/tools/policies.json
+config/tools/mcp_servers.json
+```
+
+职责：
+
+```text
+defaults:
+  enabled、timeout、max_output_chars、默认 observation_mode。
+
+providers:
+  web_search provider、search_api provider、model_builtin provider。
+
+policies:
+  allow_network、allow_command、allow_write、risk confirmation。
+
+mcp_servers:
+  用户配置的 MCP Server。
+```
+
+为什么要问：
+Tools 层配置会越来越多，提前分清楚可以避免一个巨大配置文件。
+
+你的回答：可以采取你的建议，配置需要分开放和管理
+
+
+### 问题 33：真实 provider 测试是否全部使用显式环境变量开关？
+
+建议：
+是。真实外部测试默认跳过，必须满足：
+
+```text
+RUN_TOOL_INTEGRATION_TESTS=true
+对应 provider API key 存在
+对应 provider 配置存在
+```
+
+建议再细分：
+
+```text
+RUN_WEB_SEARCH_INTEGRATION_TESTS=true
+RUN_MODEL_BUILTIN_SEARCH_TESTS=true
+RUN_MCP_INTEGRATION_TESTS=true
+```
+
+普通 CI 和本地单元测试全部使用 fake provider / fake MCP Server。
+
+为什么要问：
+避免测试被网络、额度、第三方服务波动影响。
+
+你的回答：采取你的建议
+
+
+### 问题 34：Tools V1 正式开发前是否先生成两份文档？
+
+建议：
+是。参考 Models 层开发方式：
+
+```text
+1. Tools层设计决策汇总.md
+2. Tools层开发步骤与进度.md
+```
+
+顺序：
+
+```text
+先把第一轮和第二轮问答收束成设计决策汇总
+再把阶段路线图拆成细粒度 Step
+最后按 Step 小步开发、测试和回写进度
+```
+
+为什么要问：
+避免直接从问答跳进代码，导致后续边界散落在聊天记录里。
+
+你的回答：是的，但是我觉得，其实设计文档可以已分成（1），（2）...多份，这样同一层的不同部分可以分开进行详细设计，这样避免一个文件太大导致模型一次性记不住细节，同样步骤文档也是这样的，这样做可以做的更加细致一些，包括一些没有提到过的边边角角，提到一嘴总比没有说好，这样模型开发代码也会注意更多细节
+
+
+### 问题 35：第二轮结束后是否允许直接进入设计决策汇总文档？
+
+建议：
+如果本轮没有出现新的大分歧，可以进入 `Tools层设计决策汇总.md`。
+
+如果本轮仍有明显分歧，例如：
+
+```text
+管理员权限是否 V1 放开
+MCP 是否真正纳入 V1
+预览是否作为独立工具
+命令 shell 通道是否实现
+```
+
+则可以再开 `Tools设计问题回答(3).txt`。
+
+为什么要问：
+这决定下一步是继续问答，还是进入正式设计收束。
+
+你的回答：采取你的建议，还是上一个问题说的，可以分多个设计文件

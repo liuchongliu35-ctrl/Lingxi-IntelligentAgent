@@ -1,0 +1,39 @@
+{
+  "default_text": "MockModel fixture text.",
+  "responses": [
+    {
+      "call_type": "analyzer_intent_fallback",
+      "response": {
+        "intents": [
+          {
+            "name": "search",
+            "confidence": 0.91,
+            "reason": "fixture analyzer intent"
+          }
+        ]
+      }
+    },
+    {
+      "call_type": "planner_structured_plan",
+      "response": {
+        "mode": "meso",
+        "task_units": [
+          {
+            "id": "task_1",
+            "title": "Fixture task",
+            "step_ids": ["step_1"]
+          }
+        ],
+        "steps": [
+          {
+            "id": "step_1",
+            "task_id": "task_1",
+            "step_type": "respond",
+            "description": "Return fixture plan",
+            "expected_output": "Fixture response"
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 
 from src.agent.analyzer_config import load_analyzer_config
 from src.agent.complexity_analyzer import ComplexityAnalyzer
@@ -26,102 +28,29 @@ class FakeModelManager:
 
 class AnalyzerV1Test(unittest.TestCase):
     def setUp(self):
+        self.repo_root = Path(__file__).resolve().parents[1]
         self.temp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.temp_dir.name)
-        config_dir = self.root / "config" / "analyzer"
-        config_dir.mkdir(parents=True)
-        self._write_json(
-            config_dir / "analyzer_config.json",
-            {
-                "agent_mode": "solo",
-                "max_intents": 4,
-                "intent_score_threshold": 50,
-                "pending_intent_threshold": 0.65,
-                "allow_auto_pending_intents": False,
-                "log_path": "logs/analyzer.log",
-                "pending_intents_path": "storage/analyzer/pending_intents.json",
-                "supported_file_types": ["txt", "md", "pdf", "docx", "xlsx", "csv", "json"],
-                "confidence_thresholds": {"high": 0.85, "medium": 0.6},
-            },
-        )
-        self._write_json(
-            config_dir / "intents.json",
-            [
-                "calculate",
-                "search",
-                "summarize",
-                "translate",
-                "write",
-                "read_file",
-                "write_file",
-                "move_file",
-                "copy_file",
-                "rename_file",
-                "delete_file",
-                "chat",
-            ],
-        )
-        self._write_json(
-            config_dir / "intent_keywords.json",
-            {
-                "calculate": ["计算", "+", "-", "*", "/", "×"],
-                "search": ["搜索", "查询", "找资料"],
-                "summarize": ["总结"],
-                "translate": ["翻译", "译成", "翻成"],
-                "write": ["写", "生成"],
-                "read_file": ["读取"],
-                "write_file": ["写入文件", "保存到", "输出到"],
-                "move_file": ["移动文件"],
-                "copy_file": ["复制文件"],
-                "rename_file": ["重命名", "改名"],
-                "delete_file": ["删除"],
-                "chat": ["告诉我", "怎么做"],
-            },
-        )
-        self._write_json(
-            config_dir / "risk_rules.json",
-            {
-                "domain_risks": {},
-                "confirm_intents": ["delete_file"],
-                "block_keywords": ["system32"],
-                "sensitive_paths": ["C:\\Windows"],
-            },
-        )
-        self._write_json(
-            config_dir / "complexity_weights.json",
-            {
-                "weights": {
-                    "uncertainty": 3.0,
-                    "steps": 2.0,
-                    "domain_risk": 1.8,
-                    "tools": 1.5,
-                    "information": 1.5,
-                    "data_processing": 1.2,
-                    "creativity": 1.0,
-                },
-                "thresholds": {"simple_max": 10, "medium_max": 30},
-                "risk_bonus": 10,
-            },
-        )
-        self._write_json(config_dir / "tech_stacks.json", {})
-        self._write_json(
-            config_dir / "tool_mapping.json",
-            {
-                "calculate": ["math_calculator"],
-                "search": ["search_tool"],
-                "summarize": ["text_processor"],
-                "translate": ["translator"],
-                "read_file": ["document_parser"],
-                "write_file": ["file_writer"],
-            },
-        )
+        self._copy_analyzer_config()
+        load_analyzer_config.cache_clear()
         self.config = load_analyzer_config(self.root)
 
     def tearDown(self):
         self.temp_dir.cleanup()
+        load_analyzer_config.cache_clear()
 
-    def _write_json(self, path: Path, data):
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    def _copy_analyzer_config(self):
+        source_dir = self.repo_root / "config" / "analyzer"
+        target_dir = self.root / "config" / "analyzer"
+        target_dir.mkdir(parents=True)
+        for source_path in source_dir.glob("*.json"):
+            shutil.copyfile(source_path, target_dir / source_path.name)
+
+        analyzer_config_path = target_dir / "analyzer_config.json"
+        analyzer_config = json.loads(analyzer_config_path.read_text(encoding="utf-8"))
+        analyzer_config["log_path"] = "logs/analyzer.log"
+        analyzer_config["pending_intents_path"] = "storage/analyzer/pending_intents.json"
+        analyzer_config_path.write_text(json.dumps(analyzer_config, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def _analyzer(self, model_manager=None):
         return ComplexityAnalyzer(analyzer_config=self.config, model_manager=model_manager)
@@ -141,6 +70,19 @@ class AnalyzerV1Test(unittest.TestCase):
         self.assertIn("target_language", result.missing_parameters)
         self.assertIn("请说明要翻译成哪种语言。", result.clarification_questions)
         self.assertTrue(result.requires_clarification)
+
+    def test_log_contains_decision_summary_and_trace_fields(self):
+        result = self._analyzer().analyze("翻译：hello world")
+
+        log_entry = self._read_last_log_entry()
+        self.assertEqual(log_entry["trace_id"], result.trace_id)
+        self.assertEqual(log_entry["requires_clarification"], True)
+        self.assertIn("target_language", log_entry["clarification_decision"])
+        self.assertIn("模式判定", log_entry["mode_decision"])
+        self.assertIn("工具策略", log_entry["tool_decision"])
+        self.assertIn("本轮没有写入 pending intents", log_entry["pending_intent_decision"])
+        self.assertGreaterEqual(len(log_entry["decision_summary"]), 5)
+        self.assertEqual(log_entry["user_facing_summary"], result.user_facing_summary)
 
     def test_translate_extracts_target_language_and_content(self):
         result = self._analyzer().analyze("把 hello world 翻译成中文")
@@ -173,6 +115,80 @@ class AnalyzerV1Test(unittest.TestCase):
         self.assertEqual(pending[0]["normalized_name"], "archive_files")
         self.assertEqual(pending[0]["status"], "pending")
         self.assertEqual(pending[0]["occurrence_count"], 1)
+        log_entry = self._read_last_log_entry()
+        self.assertEqual(log_entry["pending_intents_recorded"], ["archive_files"])
+        self.assertIn("archive_files", log_entry["pending_intent_decision"])
+
+    def test_fixture_cases(self):
+        cases_path = self.repo_root / "tests" / "fixtures" / "analyzer_cases.json"
+        cases = json.loads(cases_path.read_text(encoding="utf-8"))
+        self.assertGreaterEqual(len(cases), 30)
+
+        analyzer = self._analyzer()
+        for case in cases:
+            with self.subTest(case=case["name"]):
+                result = analyzer.analyze(case["text"])
+                self._assert_expected(result.to_dict(), case["expected"])
+
+    def _assert_expected(self, result: dict[str, Any], expected: dict[str, Any]):
+        direct_fields = [
+            "mode",
+            "mode_source",
+            "task_type",
+            "complexity_level",
+            "execution_strategy",
+            "action_policy",
+            "risk_level",
+            "requires_confirmation",
+            "confirmation_reason",
+            "tool_strategy",
+            "project_stage",
+        ]
+        for field in direct_fields:
+            if field in expected:
+                self.assertEqual(result.get(field), expected[field], field)
+
+        if "intent_sequence" in expected:
+            self.assertEqual(result["intent_sequence"], expected["intent_sequence"])
+        if "intent_sequence_contains" in expected:
+            self._assert_contains_all(result["intent_sequence"], expected["intent_sequence_contains"], "intent_sequence")
+        if "missing_parameters_contains" in expected:
+            self._assert_contains_all(result["missing_parameters"], expected["missing_parameters_contains"], "missing_parameters")
+        if "missing_parameters_absent" in expected:
+            self._assert_absent_all(result["missing_parameters"], expected["missing_parameters_absent"], "missing_parameters")
+        if "risk_flags_contains" in expected:
+            self._assert_contains_all(result["risk_flags"], expected["risk_flags_contains"], "risk_flags")
+        if "tech_stacks_contains" in expected:
+            self._assert_contains_all(result["tech_stacks"], expected["tech_stacks_contains"], "tech_stacks")
+        if "clarification_questions_contains" in expected:
+            self._assert_contains_all(
+                result["clarification_questions"],
+                expected["clarification_questions_contains"],
+                "clarification_questions",
+            )
+        if "parameters" in expected:
+            self._assert_mapping_subset(result["parameters"], expected["parameters"], "parameters")
+        if "file_info" in expected:
+            self._assert_mapping_subset(result["file_info"], expected["file_info"], "file_info")
+
+    def _assert_contains_all(self, actual: list[Any], expected_items: list[Any], field_name: str):
+        for item in expected_items:
+            self.assertIn(item, actual, field_name)
+
+    def _assert_absent_all(self, actual: list[Any], expected_items: list[Any], field_name: str):
+        for item in expected_items:
+            self.assertNotIn(item, actual, field_name)
+
+    def _assert_mapping_subset(self, actual: dict[str, Any], expected: dict[str, Any], field_name: str):
+        for key, value in expected.items():
+            self.assertEqual(actual.get(key), value, f"{field_name}.{key}")
+
+    def _read_last_log_entry(self) -> dict[str, Any]:
+        log_path = self.config.log_path
+        self.assertTrue(log_path.exists())
+        lines = [line for line in log_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        self.assertTrue(lines)
+        return json.loads(lines[-1])
 
 
 if __name__ == "__main__":

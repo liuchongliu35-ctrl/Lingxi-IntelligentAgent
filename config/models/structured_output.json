@@ -1,0 +1,43 @@
+{
+  "repair_enabled": true,
+  "default_repair_attempts": 1,
+  "parse_modes": {
+    "analyzer_intent_fallback": "lenient",
+    "planner_structured_plan": "lenient",
+    "react_action_decision": "strict",
+    "react_action_repair": "strict",
+    "web_search": "strict"
+  },
+  "schemas": {
+    "web_search": {
+      "type": "object",
+      "required": ["query", "summary", "results", "evidence_level", "source_quality"],
+      "properties": {
+        "query": {"type": "string"},
+        "summary": {"type": "string"},
+        "results": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["title", "url", "snippet", "source", "published_at"],
+            "properties": {
+              "title": {"type": "string"},
+              "url": {},
+              "snippet": {},
+              "source": {},
+              "published_at": {}
+            }
+          }
+        },
+        "evidence_level": {
+          "type": "string",
+          "enum": ["url_verified", "provider_reported", "model_reported", "no_url_summary"]
+        },
+        "source_quality": {
+          "type": "string",
+          "enum": ["verified_sources", "partial_sources", "summary_only", "empty"]
+        }
+      }
+    }
+  }
+}

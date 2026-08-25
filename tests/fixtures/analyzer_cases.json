@@ -1,0 +1,505 @@
+[
+  {
+    "name": "calculate_expression",
+    "text": "计算1024*768",
+    "expected": {
+      "mode": "solo",
+      "intent_sequence": ["calculate"],
+      "execution_strategy": "micro",
+      "action_policy": "allow",
+      "parameters": {"expression": "1024*768"}
+    }
+  },
+  {
+    "name": "translate_missing_target_language",
+    "text": "翻译：hello world",
+    "expected": {
+      "intent_sequence_contains": ["translate"],
+      "requires_clarification": true,
+      "missing_parameters_contains": ["target_language"],
+      "clarification_questions_contains": ["请说明要翻译成哪种语言。"]
+    }
+  },
+  {
+    "name": "translate_to_chinese",
+    "text": "把 hello world 翻译成中文",
+    "expected": {
+      "intent_sequence_contains": ["translate"],
+      "parameters": {"target_language": "zh"},
+      "missing_parameters_absent": ["target_language"]
+    }
+  },
+  {
+    "name": "translate_to_english",
+    "text": "翻译成英文：你好，世界",
+    "expected": {
+      "intent_sequence_contains": ["translate"],
+      "parameters": {"target_language": "en", "content": "你好，世界"}
+    }
+  },
+  {
+    "name": "search_summarize_topic_count_time",
+    "text": "搜索关于大语言模型的最新5篇论文并总结重点",
+    "expected": {
+      "intent_sequence": ["search", "summarize"],
+      "execution_strategy": "meso",
+      "parameters": {"topic": "大语言模型", "count": 5, "time_range": "latest"},
+      "missing_parameters_absent": ["topic"]
+    }
+  },
+  {
+    "name": "search_missing_topic",
+    "text": "搜索",
+    "expected": {
+      "intent_sequence_contains": ["search"],
+      "requires_clarification": true,
+      "missing_parameters_contains": ["topic"]
+    }
+  },
+  {
+    "name": "read_pdf_file",
+    "text": "读取 docs/report.pdf",
+    "expected": {
+      "intent_sequence_contains": ["read_file"],
+      "task_type": "document_understanding",
+      "file_info": {"file_path": "docs/report.pdf", "file_type": "pdf", "operation_type": "read", "supported": true}
+    }
+  },
+  {
+    "name": "read_file_missing_path",
+    "text": "读取文件",
+    "expected": {
+      "intent_sequence_contains": ["read_file"],
+      "requires_clarification": true,
+      "missing_parameters_contains": ["file_path"]
+    }
+  },
+  {
+    "name": "write_file_with_content",
+    "text": "写入文件 notes/todo.md：今天完成Analyzer测试",
+    "expected": {
+      "intent_sequence_contains": ["write_file"],
+      "task_type": "file_operation",
+      "file_info": {"file_path": "notes/todo.md", "file_type": "md", "operation_type": "write"},
+      "parameters": {"content": "今天完成Analyzer测试", "output_format": "md"},
+      "missing_parameters_absent": ["file_path", "content"]
+    }
+  },
+  {
+    "name": "write_file_missing_path",
+    "text": "写入文件：hello",
+    "expected": {
+      "intent_sequence_contains": ["write_file"],
+      "requires_clarification": true,
+      "missing_parameters_contains": ["file_path"]
+    }
+  },
+  {
+    "name": "move_file_paths",
+    "text": "移动文件 data/a.txt 到 archive/a.txt",
+    "expected": {
+      "intent_sequence_contains": ["move_file"],
+      "task_type": "file_operation",
+      "parameters": {"source_path": "data/a.txt", "target_path": "archive/a.txt"},
+      "missing_parameters_absent": ["source_path", "target_path"]
+    }
+  },
+  {
+    "name": "move_file_missing_target",
+    "text": "移动文件 data/a.txt",
+    "expected": {
+      "intent_sequence_contains": ["move_file"],
+      "requires_clarification": true,
+      "missing_parameters_contains": ["target_path"]
+    }
+  },
+  {
+    "name": "copy_file_paths",
+    "text": "复制文件 data/a.csv 到 backup/a.csv",
+    "expected": {
+      "intent_sequence_contains": ["copy_file"],
+      "parameters": {"source_path": "data/a.csv", "target_path": "backup/a.csv"},
+      "file_info": {"file_type": "csv"}
+    }
+  },
+  {
+    "name": "rename_file_paths",
+    "text": "重命名 data/old.json 为 data/new.json",
+    "expected": {
+      "intent_sequence_contains": ["rename_file"],
+      "parameters": {"source_path": "data/old.json", "target_path": "data/new.json"}
+    }
+  },
+  {
+    "name": "delete_file_requires_confirm",
+    "text": "删除 data/report.xlsx",
+    "expected": {
+      "intent_sequence_contains": ["delete_file"],
+      "action_policy": "confirm",
+      "requires_confirmation": true,
+      "confirmation_reason": "delete_file",
+      "risk_level": "medium"
+    }
+  },
+  {
+    "name": "chat_delete_file_no_execution",
+    "text": "只告诉我怎么删除 data/report.xlsx，不要执行",
+    "expected": {
+      "mode": "chat",
+      "intent_sequence_contains": ["delete_file", "chat"],
+      "action_policy": "allow"
+    }
+  },
+  {
+    "name": "block_sensitive_system_path",
+    "text": "删除 C:\\Windows\\System32",
+    "expected": {
+      "intent_sequence_contains": ["delete_file"],
+      "action_policy": "block",
+      "risk_level": "high",
+      "risk_flags_contains": ["dangerous_command"]
+    }
+  },
+  {
+    "name": "legal_risk",
+    "text": "帮我起草一份房屋租赁合同",
+    "expected": {
+      "intent_sequence_contains": ["write"],
+      "risk_flags_contains": ["legal"],
+      "risk_level": "medium",
+      "action_policy": "allow"
+    }
+  },
+  {
+    "name": "medical_risk",
+    "text": "帮我分析这些症状并给治疗建议",
+    "expected": {
+      "intent_sequence_contains": ["analyze"],
+      "risk_flags_contains": ["medical"],
+      "risk_level": "medium"
+    }
+  },
+  {
+    "name": "finance_risk",
+    "text": "分析一下这只股票是否值得投资",
+    "expected": {
+      "intent_sequence_contains": ["analyze"],
+      "risk_flags_contains": ["finance"],
+      "risk_level": "medium"
+    }
+  },
+  {
+    "name": "privacy_risk",
+    "text": "帮我整理身份证和手机号信息",
+    "expected": {
+      "risk_flags_contains": ["privacy"],
+      "risk_level": "medium"
+    }
+  },
+  {
+    "name": "chat_mode_override",
+    "text": "只告诉我怎么读取 report.pdf，不要执行",
+    "expected": {
+      "mode": "chat",
+      "mode_source": "input_override",
+      "intent_sequence_contains": ["read_file", "chat"],
+      "file_info": {"file_path": "report.pdf", "file_type": "pdf"}
+    }
+  },
+  {
+    "name": "solo_mode_last_override",
+    "text": "只告诉我步骤，最后还是直接帮我完成",
+    "expected": {
+      "mode": "solo",
+      "mode_source": "input_override"
+    }
+  },
+  {
+    "name": "ambiguous_analyze_macro",
+    "text": "帮我分析一下市场",
+    "expected": {
+      "intent_sequence_contains": ["analyze"],
+      "complexity_level": "ambiguous",
+      "execution_strategy": "macro"
+    }
+  },
+  {
+    "name": "summarize_file",
+    "text": "总结 docs/spec.md 的重点",
+    "expected": {
+      "intent_sequence_contains": ["summarize"],
+      "task_type": "document_understanding",
+      "file_info": {"file_path": "docs/spec.md", "file_type": "md"}
+    }
+  },
+  {
+    "name": "extract_from_excel",
+    "text": "从 data/sales.xlsx 提取销售额数据",
+    "expected": {
+      "intent_sequence_contains": ["extract"],
+      "task_type": "document_understanding",
+      "file_info": {"file_path": "data/sales.xlsx", "file_type": "xlsx"},
+      "parameters": {"file_type": "xlsx"}
+    }
+  },
+  {
+    "name": "generate_markdown_report",
+    "text": "生成关于本周开发进度的 Markdown 报告",
+    "expected": {
+      "intent_sequence_contains": ["write"],
+      "task_type": "content_generation",
+      "parameters": {"topic": "本周开发进度", "output_format": "md"}
+    }
+  },
+  {
+    "name": "software_debug_stack",
+    "text": "帮我调试 FastAPI 项目的 pytest 报错",
+    "expected": {
+      "intent_sequence_contains": ["debug_code"],
+      "task_type": "software_engineering",
+      "project_stage": "debug",
+      "tech_stacks_contains": ["python", "backend", "testing"]
+    }
+  },
+  {
+    "name": "software_deploy_stack",
+    "text": "部署 React 和 FastAPI 项目到 Docker",
+    "expected": {
+      "intent_sequence_contains": ["deploy_project"],
+      "task_type": "software_engineering",
+      "project_stage": "deploy",
+      "tech_stacks_contains": ["frontend", "backend", "deployment"]
+    }
+  },
+  {
+    "name": "deep_learning_stack",
+    "text": "用 PyTorch 和 transformers 训练一个文本分类模型",
+    "expected": {
+      "task_type": "software_engineering",
+      "project_stage": "develop",
+      "tech_stacks_contains": ["deep_learning"]
+    }
+  },
+  {
+    "name": "recommend_python_books",
+    "text": "推荐几本Python入门书籍",
+    "expected": {
+      "intent_sequence_contains": ["recommend"],
+      "parameters": {"topic": "几本Python入门书籍"},
+      "tech_stacks_contains": ["python"]
+    }
+  },
+  {
+    "name": "list_files",
+    "text": "列出文件 src/agent",
+    "expected": {
+      "intent_sequence_contains": ["list_files"],
+      "task_type": "file_operation"
+    }
+  },
+  {
+    "name": "ordered_translate_then_summarize",
+    "text": "先翻译 docs/en.md 成中文，然后总结重点",
+    "expected": {
+      "intent_sequence": ["translate", "summarize"],
+      "parameters": {"target_language": "zh"},
+      "file_info": {"file_path": "docs/en.md", "file_type": "md"}
+    }
+  },
+  {
+    "name": "ordered_search_then_write_report",
+    "text": "先搜索Python测试框架，然后写一份Markdown报告",
+    "expected": {
+      "intent_sequence_contains": ["search", "write"],
+      "parameters": {"topic": "Python测试框架", "output_format": "md"}
+    }
+  },
+  {
+    "name": "create_project_specific_intent",
+    "text": "创建一个 FastAPI 项目",
+    "expected": {
+      "intent_sequence_contains": ["create_project"],
+      "task_type": "software_engineering",
+      "project_stage": "develop",
+      "tech_stacks_contains": ["python", "backend"]
+    }
+  },
+  {
+    "name": "design_project_specific_intent",
+    "text": "设计一个 React 后台管理系统的架构",
+    "expected": {
+      "intent_sequence_contains": ["design_project"],
+      "task_type": "software_engineering",
+      "project_stage": "design",
+      "tech_stacks_contains": ["frontend"]
+    }
+  },
+  {
+    "name": "convert_format_specific_intent",
+    "text": "把 report.md 转换为 pdf",
+    "expected": {
+      "intent_sequence_contains": ["convert_format"],
+      "file_info": {"file_path": "report.md", "file_type": "md"},
+      "parameters": {"output_format": "pdf"}
+    }
+  },
+  {
+    "name": "read_report_md_does_not_trigger_generate_report",
+    "text": "读取 report.md",
+    "expected": {
+      "intent_sequence": ["read_file"],
+      "file_info": {"file_path": "report.md", "file_type": "md"}
+    }
+  },
+  {
+    "name": "explain_execute_code_is_chat_mode",
+    "text": "告诉我怎么运行代码，不要执行",
+    "expected": {
+      "mode": "chat",
+      "intent_sequence_contains": ["execute_code", "chat"],
+      "action_policy": "allow"
+    }
+  },
+  {
+    "name": "create_project_not_generic_write",
+    "text": "帮我创建一个 Java Spring Boot 项目",
+    "expected": {
+      "intent_sequence_contains": ["create_project"],
+      "task_type": "software_engineering",
+      "project_stage": "develop",
+      "tech_stacks_contains": ["java", "backend"]
+    }
+  },
+  {
+    "name": "data_analysis_csv_trend",
+    "text": "分析 data/sales.csv 里的销售趋势并生成图表",
+    "expected": {
+      "task_type": "data_analysis",
+      "file_info": {"file_path": "data/sales.csv", "file_type": "csv"}
+    }
+  },
+  {
+    "name": "project_management_plan",
+    "text": "规划下周项目开发计划",
+    "expected": {
+      "intent_sequence_contains": ["plan"],
+      "task_type": "project_management",
+      "project_stage": "design"
+    }
+  },
+  {
+    "name": "document_stage_readme",
+    "text": "为 README.md 编写使用说明",
+    "expected": {
+      "intent_sequence_contains": ["write"],
+      "task_type": "content_generation",
+      "project_stage": "document",
+      "file_info": {"file_path": "README.md", "file_type": "md"}
+    }
+  },
+  {
+    "name": "cpp_backend_stack",
+    "text": "用 C++ 和 CMake 开发一个后端服务",
+    "expected": {
+      "task_type": "software_engineering",
+      "project_stage": "develop",
+      "tech_stacks_contains": ["cpp"]
+    }
+  },
+  {
+    "name": "database_design_stack",
+    "text": "设计 MySQL 和 Redis 的缓存架构",
+    "expected": {
+      "task_type": "software_engineering",
+      "project_stage": "design",
+      "tech_stacks_contains": ["database"]
+    }
+  },
+  {
+    "name": "frontend_testing_stack",
+    "text": "给 React 页面增加 Playwright 测试",
+    "expected": {
+      "task_type": "software_engineering",
+      "project_stage": "test",
+      "tech_stacks_contains": ["frontend", "testing"]
+    }
+  },
+  {
+    "name": "deployment_pipeline_stack",
+    "text": "配置 GitHub Actions 和 Docker 部署流程",
+    "expected": {
+      "task_type": "software_engineering",
+      "project_stage": "deploy",
+      "tech_stacks_contains": ["deployment"]
+    }
+  },
+  {
+    "name": "tool_operation_time_query",
+    "text": "查看当前时间",
+    "expected": {
+      "task_type": "tool_operation"
+    }
+  },
+  {
+    "name": "execute_code_requires_confirm",
+    "text": "执行代码 print('hello')",
+    "expected": {
+      "intent_sequence_contains": ["execute_code"],
+      "action_policy": "confirm",
+      "requires_confirmation": true,
+      "confirmation_reason": "execute_code",
+      "risk_level": "medium"
+    }
+  },
+  {
+    "name": "dangerous_rm_rf_blocks",
+    "text": "执行命令 rm -rf /",
+    "expected": {
+      "intent_sequence_contains": ["execute_code"],
+      "action_policy": "block",
+      "requires_confirmation": false,
+      "confirmation_reason": "blocked_risk",
+      "risk_level": "high",
+      "risk_flags_contains": ["dangerous_command"]
+    }
+  },
+  {
+    "name": "chat_dangerous_command_guidance_does_not_execute",
+    "text": "告诉我 rm -rf / 是什么，不要执行",
+    "expected": {
+      "mode": "chat",
+      "action_policy": "allow",
+      "risk_level": "high",
+      "risk_flags_contains": ["dangerous_command", "dangerous_command_guidance"]
+    }
+  },
+  {
+    "name": "delete_sensitive_unix_path_blocks",
+    "text": "删除 /etc/passwd",
+    "expected": {
+      "intent_sequence_contains": ["delete_file"],
+      "action_policy": "block",
+      "risk_level": "high",
+      "risk_flags_contains": ["sensitive_path"]
+    }
+  },
+  {
+    "name": "delete_program_files_blocks",
+    "text": "删除 C:\\Program Files\\app\\config.txt",
+    "expected": {
+      "intent_sequence_contains": ["delete_file"],
+      "action_policy": "block",
+      "risk_level": "high",
+      "risk_flags_contains": ["sensitive_path"]
+    }
+  },
+  {
+    "name": "privacy_api_key_risk",
+    "text": "帮我整理这些 API key 和密钥",
+    "expected": {
+      "risk_flags_contains": ["privacy"],
+      "risk_level": "medium",
+      "action_policy": "allow"
+    }
+  }
+]

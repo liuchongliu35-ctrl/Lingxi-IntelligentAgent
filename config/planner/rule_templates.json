@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "description": "Planner V1 rule template placeholders. Concrete templates are implemented in code first and can be migrated here later.",
+  "pipelines": {
+    "search_summarize": ["search", "summarize"],
+    "search_summarize_write_file": ["search", "summarize", "write_file"],
+    "read_file_summarize": ["read_file", "summarize"],
+    "read_file_extract_write_file": ["read_file", "extract", "write_file"],
+    "translate_write_file": ["translate", "write_file"]
+  }
+}

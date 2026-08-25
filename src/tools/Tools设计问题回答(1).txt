@@ -1,0 +1,2693 @@
+# Tools 设计问题回答（1）
+
+本文档用于第一轮确认 Tools 层 V1 正式化的设计问题。请直接在每个“你的回答：”后面填写答案。
+
+说明：
+- 这些问题不是考试题，目的是把 Tools 层 V1 的职责边界、ToolResult 协议、ToolRegistry / ToolManager 关系、基础工具范围、命令与文件安全、联网搜索方案、权限确认、日志观测、错误分类和验收步骤定清楚。
+- Tools 层必须服务当前已经完成的 Analyzer V1、Planner V1、ReActExecutor V1 第二阶段和 Models V1，不重新设计这些层的主链路。
+- 当前外部编排链路已经是：
+
+```text
+用户输入
+  -> ReactAgent
+  -> Analyzer
+  -> Planner
+  -> ReActExecutor
+  -> 输出反馈处理器
+  -> 用户反馈
+```
+
+`输出反馈处理器` 是主链路收尾边界，负责把 ReActExecutor / ReactAgent 产出的 `ExecutionEvent` 和 `ExecutionResult` 转换成用户可见反馈。它不重新做 Analyzer、Planner 或 ReActExecutor 的决策，也不直接执行工具。
+
+`ExecutionResult` 和 `ExecutionEvent` 不是独立业务层，而是 ReActExecutor / ReactAgent 对上层返回的结构化输出协议：
+
+```text
+ExecutionResult:
+  一次执行结束后的最终结构化结果，例如 status、success、output、summary、observations、events、pending_confirmation、error_code。
+
+ExecutionEvent:
+  执行过程中的事件流对象，例如 step_started、tool_started、tool_finished、observation_created、final_answer。
+```
+
+执行器内部通过模型或执行器规则生成的用户可见步骤说明，例如计划摘要、动作摘要、工具进度、阶段性说明和确认请求，应作为摘要化 `ExecutionEvent` 交给输出反馈处理器。原始 prompt、内部推理、工具 raw output、异常堆栈和开发日志不直接进入用户反馈。
+
+其中 `Observation` 和 `Checker` 也不是独立于执行器之外的新主链路层，而是 ReActExecutor 内部执行循环中的环节。ReActExecutor 在执行 `ActionPacket` 时，可能会按动作类型调用 Tool 层、Models 层、User 控制或 Control 动作：
+
+```text
+ReActExecutor 内部循环：
+  ActionPacket
+    -> 调用 Tool / Model / User / Control
+    -> 根据真实调用结果生成 Observation
+    -> Checker 判断继续、重试、完成或终止
+    -> 记录事件，并最终汇总为 ExecutionResult
+```
+
+这里的 `Model` 调用只表示 ReActExecutor 内部可能使用 Models 层，并不表示 Models 层是 ReActExecutor 的内部子模块。Models 层是项目级基础模型服务层，Analyzer、Planner、ReActExecutor 以及后续 Memory / RAG 等模块都可以调用它。旧顺序 Executor 只是早期原型/历史诊断参考，不再作为正式适配目标。
+
+当前项目分层总览：
+
+```text
+已完成或作为当前核心主链路：
+  ReactAgent 编排层
+  Analyzer 层
+  Planner 层
+  ReActExecutor 层
+  输出反馈处理器
+
+基础服务层：
+  Models 层
+  Tools 层
+
+后续支撑与增强层：
+  Runtime / API / Session 层
+  Memory 层增强
+  RAG / 知识库层增强
+  安全与权限层统一（安全策略层）
+  配置、日志、观测与端到端验收工程
+```
+
+各层关系简述：
+
+```text
+ReactAgent:
+  接收用户输入，串联 Analyzer / Planner / ReActExecutor，并向上层暴露 run / run_with_result / run_stream。
+
+Analyzer:
+  负责理解输入、识别意图、参数、风险和执行策略。
+
+Planner:
+  负责生成 TaskPlan / TaskUnit / PlanStep。
+
+ReActExecutor:
+  负责执行 Planner-guided ReAct 循环，调用 Tool / Model / User / Control，生成 Observation、事件和最终结果。
+
+输出反馈处理器:
+  负责把 ExecutionEvent / ExecutionResult 整理成用户能看到的过程反馈和最终回答。
+
+Models:
+  项目级基础模型服务层，可被 Analyzer、Planner、ReActExecutor 和后续 Memory / RAG 调用；旧顺序 Executor 不再作为正式适配目标。
+
+Tools:
+  项目级工具能力服务层，提供真实外部能力并返回 ToolResult；当前主要由 ReActExecutor 通过 ActionPacket 调用。
+```
+
+模型作为大脑的关键原则：
+
+```text
+本项目目标是模型作为大脑的灵活任务型 Agent，不是规则硬编码结果的固定流程助手。
+```
+
+Tools V1 设计时必须注意：
+
+```text
+工具层负责真实执行、结构化返回、权限边界、错误分类、日志审计。
+工具层不负责替代模型理解用户意图，不负责生成复杂计划，不负责决定下一步动作。
+需要理解、判断、生成、决策、总结、修复的地方，应保留或调用 Models 层。
+```
+
+典型边界：
+
+```text
+Analyzer:
+  LLM fallback 通过 Models 层做意图、参数、风险、复杂度和执行策略兜底。
+
+Planner:
+  LLM planner fallback 通过 Models 层生成结构化计划。
+
+ReActExecutor:
+  Thought / ActionPacket 决策、ActionPacket repair、call_model、fallback_to_model、复杂总结和 final answer 都应走 Models 层。
+
+Tools:
+  普通工具只做真实执行。
+  web_search 的 model_builtin provider、后续模型翻译/摘要/改写工具可以通过 Models 层调用。
+```
+
+规则适合用于 schema 校验、权限与安全边界、错误码分类、timeout/retry/fallback 策略和测试 fake/mock，不应硬编码复杂计划、ActionPacket 决策、最终回答或模型总结来冒充模型能力。
+
+- ReActExecutor 已经要求模型通过 `ActionPacket` 等结构化协议指挥执行器；工具调用必须由 ReActExecutor 校验后执行。
+- Observation 必须由执行器根据真实 Tool / Model / User / Control 结果生成，模型不能伪造 Observation。
+- ReActExecutor 不直接执行 shell；命令必须走 Tool 层。
+- 用户可见 events 和开发 logs 必须分离。
+- Models V1 已经正式化，Tools V1 应消费或配合现有 Models / ReActExecutor 结构化协议，不重做模型层。
+- Tool 层必须返回真实、结构化、可审计的 ToolResult，不能让模型直接伪造工具执行结果。
+- 如果你不确定，可以写“按你的建议来”，后续我会按任务型 Agent 的常见工程做法给出保守方案。
+- 有些问题后面写了“为什么要问”，方便你理解这个问题会影响哪部分设计。
+- 如果本轮回答后仍有不明确的点，后续会继续生成 `Tools设计问题回答(2).txt`、`Tools设计问题回答(3).txt` 等。
+
+当前 Tools 层真实状态：
+
+```text
+src/tools/base.py              # ToolResult: success / data / message / error / code
+src/tools/registry.py          # ToolSpec / ToolRegistry: 工具 schema、风险、确认、workspace_scope
+src/tools/tool_manager.py      # ToolManager: 当前硬编码注册和执行工具
+src/tools/command_tool.py      # CommandTool: 受控命令执行，默认 shell=False
+src/tools/document_parser.py   # DocumentParser: 基础文档读取
+src/tools/file_writer.py       # FileWriter: 基础工作区写文件
+src/tools/search_tool.py       # SearchTool: 当前 Bing API key 包装
+src/tools/code_executor.py     # CodeExecutor: 受控 Python 执行，默认关闭
+src/tools/math_calculator.py   # MathCalculator
+src/tools/text_processor.py    # TextProcessor
+src/tools/time_query.py        # TimeQuery
+src/tools/translator.py        # Translator mock placeholder
+```
+
+当前相关测试重点：
+
+```text
+tests/test_tool_registry_v1.py
+tests/test_command_tool_v1.py
+tests/test_react_executor_tool_action.py
+tests/test_react_executor_command_action.py
+tests/test_react_executor_safety.py
+tests/test_react_executor_invariants.py
+tests/test_analyzer_planner_react_executor_pipeline.py
+```
+
+当前主要问题：
+
+```text
+ToolResult 外壳已有，但字段偏少，缺少 metadata / trace / duration / retryable / raw_output / error_type 等工程化字段。
+ToolRegistry 已经承担工具描述、schema、风险等级和确认策略，但 ToolManager 执行时还没有完全基于 Registry 做统一校验。
+ToolManager 仍硬编码工具实例和描述。
+部分工具返回裸字符串或松散对象，data schema 不稳定。
+SearchTool 当前绑定 Bing API key，尚未形成 provider adapter。
+缺少 logs/tools.log JSONL 工具执行日志。
+文件工具能力不完整，只有基础 file_writer。
+DocumentParser 格式和安全边界还不够正式。
+CommandTool 已有基础保护，但 V1 需要明确权限、确认、超时、错误分类和审计字段。
+```
+
+---
+
+## 1. Tools 层在整体 Agent 中的定位
+
+### 问题 1：你是否同意 Tools 层只负责“真实外部能力执行”，不承担 Analyzer / Planner / ReActExecutor 的职责？
+
+通俗解释：
+Analyzer 负责理解用户意图，Planner 负责制定计划，ReActExecutor 负责执行循环、ActionPacket 校验、确认、调用工具和生成 Observation。Tools 层不应该自己判断任务路线，也不应该自己生成 Observation，更不应该让模型绕过执行器直接执行工具。
+
+建议：
+Tools V1 定位为统一工具服务层：
+
+```text
+接收已校验的工具调用请求
+  -> 根据 ToolSpec / ToolPolicy 做参数、安全、权限、超时校验
+  -> 执行真实工具
+  -> 返回结构化 ToolResult
+  -> 写入开发日志 logs/tools.log
+```
+
+工具可以返回执行结果和审计信息，但不决定下一步该做什么。下一步动作仍由 ReActExecutor 根据 Observation / Checker / ActionPacket 决定。
+
+为什么要问：
+这决定 Tools 层是基础执行服务，还是会膨胀成第二个执行器。
+
+你的回答：采取你的建议
+
+
+### 问题 2：Tools 层是否允许模型直接调用工具？
+
+通俗解释：
+模型可以生成 `ActionPacket`，其中包含 `tool_name` 和 `args`，但真正调用工具的人应该是 ReActExecutor，而不是模型 provider 或 Models 层。
+
+建议：
+不允许模型直接调用工具。正式链路应是：
+
+```text
+Model 生成 ActionPacket
+  -> ReActExecutor 解析和校验
+  -> ToolRegistry 校验工具是否存在、参数是否合规、风险是否允许
+  -> 需要确认时进入 confirmation 流程
+  -> ToolManager / ToolRuntime 执行真实工具
+  -> ToolResult
+  -> ReActExecutor 生成 Observation
+```
+
+为什么要问：
+如果模型能直接调用工具，Observation、权限确认、日志审计都会失控。
+
+你的回答：采取你的建议
+
+
+### 问题 3：旧 Executor 和旧 ToolManager 是否继续保留兼容？
+
+修正说明：
+第一轮问题里把旧 Executor 写成“legacy 回退”，这是一个文档级架构误解。旧顺序 Executor 从未作为正式执行架构完成，也无法解决新 ReActExecutor 解决不了的问题，因此不能把它描述成新链路失败后的可靠 fallback。
+
+建议：
+Tools V1 不以兼容旧顺序 Executor 为目标。正式链路应直接收束为：
+
+```text
+ReactAgent
+  -> Analyzer
+  -> Planner
+  -> ReActExecutor
+  -> 新 ToolRegistry / ToolManager / ToolRuntime
+  -> ToolResult
+```
+
+旧 Executor 的处理策略：
+
+```text
+旧 Executor:
+  仅作为早期原型/历史诊断参考或后续清理对象。
+  不作为新 ReActExecutor 失败后的自动回退路径。
+  不作为 Tools V1 正式验收目标。
+
+旧 ToolManager 旧逻辑:
+  不保留为第二套正式执行逻辑。
+
+新 ToolManager:
+  可以保留 run_tool 方法名作为当前代码和测试迁移入口。
+  但内部必须使用新的 ToolCallRequest / ToolRegistry / 权限 / 日志 / ToolResult 协议。
+```
+
+为什么要问：
+这决定 Tools V1 是直接服务 ReActExecutor 新架构，还是继续背负旧顺序执行器的历史包袱。当前结论应以后者为错误理解，正式设计按 ReActExecutor 新链路推进。
+
+你的回答：反正目前旧的Executor逻辑已经不使用了（已经完全使用ReActExecutor这个架构了），所以对应的旧 ToolManager可以完全弃掉，完全使用新的，我的倾向是要使用新的就一次性替换成新的，旧的就没必要保留了。反正旧的ToolManager和Executor当时初期也只是简单实现表示有这个东西，是没有结果详细设计的、还是以后续的新设计为准
+
+
+### 问题 4：Tools 层是否应该统一面向“结构化 ActionPacket”，而不是自然语言工具指令？
+
+建议：
+是。Tools 层只接受结构化参数，不接受模型自然语言命令。例如：
+
+```json
+{
+  "action_type": "tool",
+  "tool_name": "read_file",
+  "args": {
+    "path": "README.md"
+  }
+}
+```
+
+不要让工具自己解析“帮我读一下 README”这种自然语言。自然语言到结构化参数的转换属于模型和 ReActExecutor 的职责。
+
+为什么要问：
+这会影响每个工具的参数 schema、错误分类和测试方式。
+
+你的回答：采取你的建议
+
+
+---
+
+## 2. ToolResult V1 协议
+
+### 问题 5：是否将 `ToolResult` 外壳统一为所有工具的正式返回协议？
+
+当前状态：
+`ToolResult` 已有：
+
+```python
+success
+data
+message
+error
+code
+```
+
+建议：
+保留这个外壳，并扩展为 V1 正式结构：
+
+```python
+ToolResult(
+    success: bool,
+    data: Any,
+    message: str,
+    error: str | None,
+    code: str,
+    error_type: str | None,
+    retryable: bool,
+    tool_name: str,
+    provider: str | None,
+    started_at: str,
+    ended_at: str,
+    duration_ms: int,
+    trace_id: str | None,
+    call_id: str,
+    raw_output: Any | None,
+    metadata: dict,
+)
+```
+
+外壳统一，`data` 按不同工具定义不同 schema：
+
+```text
+web_search.data       = WebSearchData
+command_tool.data     = CommandExecutionData
+read_file.data        = FileReadData
+write_file.data       = FileWriteData
+document_parser.data  = DocumentParseData
+math_calculator.data  = CalculationData
+```
+
+为什么要问：
+这决定 Tool 层是否像 Models 层一样正式工程化，而不是简单返回字符串。
+
+你的回答：可以采取你的建议，处理建议里面的字段还需要哪些字段你看着办，还有是不是应该有一个字段表示这个工具调用是哪一类，比如是搜索那就是search，编辑那就是edit，这种表示本次工具调用时调用哪种工具，包括后续返回工具调用错误时也需要点名这个
+
+
+### 问题 6：工具失败时是否必须返回 `success=False`，不能把错误包装成成功文本？
+
+建议：
+必须。比如搜索未配置、文件不存在、命令超时、权限不足，都应该返回：
+
+```python
+ToolResult(
+    success=False,
+    data={...可审计上下文...},
+    error="Search is not configured.",
+    code="search_not_configured"
+)
+```
+
+不建议返回：
+
+```python
+ToolResult(success=True, data="Search failed: ...")
+```
+
+为什么要问：
+ReActExecutor 和 Checker 必须能区分真实成功、失败、可重试失败和需要用户确认。
+
+你的回答：采取你的建议，ToolResult还需要加上工具调用类型
+
+
+### 问题 7：`message` 字段应该给谁看？
+
+建议：
+`message` 是短的人类可读摘要，可用于 Observation 摘要或用户可见 event 的基础材料，但不要放完整 stdout、大文件内容、敏感数据。完整结构放 `data`，原始输出必要时放 `raw_output` 或受限日志。
+
+建议规则：
+
+```text
+message:
+  简短、可读、可展示
+
+data:
+  结构化结果，供执行器和测试消费
+
+error/code/error_type:
+  结构化失败信息
+
+metadata:
+  trace、策略、provider、脱敏状态、截断状态等
+
+raw_output:
+  可选，默认不进入用户可见事件，日志也要按策略截断/脱敏
+```
+
+为什么要问：
+避免把命令输出、文件内容、网页内容全部塞进用户可见事件。
+
+你的回答：可以采取你的建议，message可以作为给用户查看的执行结果（就像codex这样的）
+codex这样例子：
+你这个补充很关键：主链路图需要既“干净”，又能表达执行器不是黑盒，执行过程会通过事件/步骤说明持续反馈给用户。我会把它整理成：主编排链路后接一个“输出反馈处理器”，同时明确它消费 ExecutionEvent / ExecutionResult，不参与工具执行和决策。（这个就是一些描述，描述计划、做了什么、下一步做什么，模型使用人话描述）
+
+我会把“输出反馈处理器”写成一个边界明确的收尾节点：它不是新的决策层，也不调用工具；它负责消费执行器产出的 ExecutionEvent / ExecutionResult，把可见步骤说明、工具进度、确认请求和最终结果反馈给用户。当前可以由 ReactAgent.run_stream、EventStream、ExecutionResultBuilder 承担，后续 Runtime/API 层再正式服务化。（这个就是一些描述，描述计划、做了什么、下一步做什么，模型使用人话描述）
+
+Edited files（这个就是调用工具时的执行日志，比如这个是编辑的执行动作，调用编辑工具，然后点击这几个文字就可以展开看到：
+Edited files
+Edited 开发进度.md+9-1[这个也可以点击展开，然后可以看到新增了哪9行，减少了哪一行]
+Edited 开发方案.md+4-0这样的东西）
+
+我已经把总链路补成“执行器 -> 输出反馈处理器 -> 用户反馈”，并把“Codex 这种执行计划/日志交替出现”的设计意图写成可见事件流边界。接下来会同步到整体设计和 Models/Tools 文档里，保持所有入口文档一致。
+
+Edited agent整体设计.md+33-1（同上）
+
+整体设计文档现在加了一段“各层关系可以概括为”，把编排层、理解层、计划层、执行器、输出反馈、基础服务层和后续支撑层都分开了。这个会成为后续所有层开发的总地图。
+
+Edited files（同上）
+
+我还同步了 Models 已完成文档和 Tools 问答文档，避免后续看 Models 文档的人仍然把输出事件/结果误认为一层。现在输出反馈处理器被明确为“收尾反馈边界”，而不是执行或决策层。
+
+
+所以调用工具时产生的一些日志和信息也需要和用户交互时作为展示的，这个就需要工具层在执行时产生简明的描述和执行结果
+
+
+### 问题 8：ToolResult 是否需要 `artifact` 或 `output_files` 字段？
+
+背景：
+文件写入、文档解析、代码执行、搜索缓存等工具可能生成文件或中间产物。
+
+建议：
+V1 可先放在 `metadata.artifacts`，格式统一：
+
+```json
+{
+  "artifacts": [
+    {
+      "type": "file",
+      "path": "workspace-relative/path.txt",
+      "mime_type": "text/plain",
+      "size_bytes": 1234,
+      "created": true
+    }
+  ]
+}
+```
+
+后续如果 artifact 变多，再升级成一等字段。
+
+为什么要问：
+这会影响文件工具、文档解析和后续 UI 展示。
+
+你的回答：采取你的建议，这个最好完善一下，和上一个问题的回答里面提到的一样，这个可能会涉及到向用户展示的一些执行过程信息和结果
+
+
+### 问题 9：ToolResult 是否需要记录 `input_summary` 而不是完整输入？
+
+建议：
+需要。工具日志里默认记录参数摘要，不记录完整敏感内容。比如：
+
+```text
+read_file:
+  记录 path / size
+  不默认记录完整文件内容
+
+write_file:
+  记录 path / content_length / content_hash
+  不默认记录完整 content
+
+command_tool:
+  记录 command / cwd / timeout / exit_code
+  stdout/stderr 截断
+
+web_search:
+  记录 query / provider / max_results
+  可记录 URL，不记录完整网页正文
+```
+
+为什么要问：
+这是日志可观测性和隐私边界之间的平衡。
+
+你的回答：采取你的建议，但是这个input_summary最好不要单独的去调用模型去生成，可以在这一步工具调用前调用模型生成本次工具调用指挥时顺带生成，反正不要为了精简这个东西而去专门调用一次模型
+
+
+---
+
+## 3. 错误码、错误类型和 retry
+
+### 问题 10：Tools V1 是否需要统一错误码枚举？
+
+建议：
+需要。建议先定义通用错误类型：
+
+```text
+invalid_args
+tool_not_found
+tool_disabled
+permission_denied
+confirmation_required
+outside_workspace
+file_not_found
+file_too_large
+unsupported_file_type
+command_blocked
+command_timeout
+command_failed
+network_not_allowed
+search_not_configured
+provider_not_configured
+provider_timeout
+provider_rate_limited
+provider_error
+parse_failed
+output_too_large
+user_cancelled
+internal_error
+```
+
+同时区分：
+
+```text
+error_type:
+  validation_error
+  permission_error
+  runtime_error
+  provider_error
+  timeout_error
+  safety_error
+  user_control
+
+retryable:
+  true / false
+```
+
+为什么要问：
+ReActExecutor 的 retry、fallback、Checker 判断和用户提示都依赖错误分类。
+
+你的回答：采取你的建议，如果还缺少你尽量去多想一些
+
+
+### 问题 11：哪些工具错误可以自动 retry？
+
+建议：
+保守 retry。只对明显瞬时错误 retry：
+
+```text
+可 retry:
+  provider_timeout
+  provider_rate_limited
+  provider_server_error
+  transient_network_error
+  temporary_file_lock
+
+不可 retry:
+  invalid_args
+  tool_not_found
+  permission_denied
+  confirmation_required
+  outside_workspace
+  file_not_found
+  unsupported_file_type
+  command_blocked
+  destructive_risk
+  user_cancelled
+```
+
+命令工具默认不自动 retry，除非调用方明确标记命令是幂等的，例如只读查询命令。
+
+为什么要问：
+自动重试写文件、删除文件、运行命令可能造成重复副作用。
+
+你的回答：采取你的建议，这个模型重试一个道理，那种明显错误的不能成功的调用就直接判为错误不需要重试（比如权限不够这种根本不是agent可以处理的），但是那种因为稳定性或者agent可以处理通过重试解决的就可以retry
+
+
+### 问题 12：timeout 应该由 ToolSpec、调用参数还是全局配置决定？
+
+建议：
+三层合并，取最保守值：
+
+```text
+全局默认 timeout
+ToolSpec 默认 timeout
+ActionPacket / ReActExecutor 传入 timeout
+工具自身最大 timeout 上限
+```
+
+最终规则：
+
+```text
+effective_timeout = min(requested_timeout, tool_max_timeout)
+如果未传 requested_timeout，使用 ToolSpec timeout
+如果 ToolSpec 未配置，使用全局默认
+```
+
+建议默认：
+
+```text
+低风险普通工具: 5-10 秒
+文件读取/文档解析: 10-30 秒
+web_search: 20-30 秒
+command_tool: 默认 30 秒，最大 60 秒
+code_executor: 默认 10 秒，最大 30 秒
+```
+
+为什么要问：
+防止单个工具卡死整个 ReActExecutor 循环。
+
+你的回答：采取你的建议
+
+
+---
+
+## 4. ToolRegistry / ToolManager / ToolRuntime 关系
+
+### 问题 13：你是否同意 `ToolRegistry` 负责“工具声明和校验”，`ToolManager` 负责“工具实例和执行”？
+
+当前状态：
+`ToolRegistry` 已经有 ToolSpec、参数 schema、风险等级、确认策略、workspace_scope。
+`ToolManager` 当前硬编码工具实例，并直接执行。
+
+建议：
+V1 明确拆分：
+
+```text
+ToolRegistry:
+  工具名称
+  描述
+  参数 schema
+  返回 schema
+  风险等级
+  是否需要确认
+  workspace_scope
+  timeout
+  category
+  provider 能力声明
+
+ToolManager:
+  注册工具实例
+  接收 ToolCallRequest
+  查 Registry 做校验
+  执行 tool.run()
+  包装 ToolResult
+  记录 logs/tools.log
+```
+
+如果后续复杂度增加，可以新增 `ToolRuntime` 作为执行器，`ToolManager` 变成门面 facade。但 V1 可先不强拆太多文件。
+
+为什么要问：
+这决定现有 registry 和 manager 的职责是否正式固定。
+
+你的回答：采取你的建议
+
+
+### 问题 14：ToolSpec 是否要成为模型可见工具列表的唯一来源？
+
+建议：
+是。ReActExecutor 给模型看的可用工具应该来自 `ToolRegistry.to_model_specs()`，而不是 `ToolManager.list_tools()` 的硬编码描述。
+
+但 ToolSpec 暴露给模型时需要过滤字段：
+
+```text
+模型可见:
+  name
+  description
+  parameters_schema
+  required_params
+  risk_level
+  requires_confirmation
+  workspace_scope
+  timeout
+
+模型不可见或默认不暴露:
+  内部 provider key
+  完整安全策略
+  日志路径
+  系统路径
+  hidden metadata
+```
+
+为什么要问：
+模型只能基于稳定 ToolSpec 生成 ActionPacket，否则容易调用不存在或参数错误的工具。
+
+你的回答：是的，采取你的建议，而且需要约定好工具固定的名称，统一好整条路径的工具口径，这样从模型指挥调用工具到工具层执行工具，到返回执行结果其中涉及到的工具名都是统一约定好的，确保模型不会偏离或者生成出一个不存在的工具名称。最好使用英文比较好，中文的话感觉不太好
+
+
+### 问题 15：ToolManager 执行前是否必须调用 ToolRegistry 参数校验？
+
+建议：
+必须。执行顺序：
+
+```text
+1. tool_name 是否存在
+2. args 是否 object
+3. required_params 是否齐全
+4. 参数类型是否符合 schema
+5. workspace_scope / risk / confirmation 是否满足
+6. timeout 是否在工具上限内
+7. 执行工具
+8. 校验/归一化 ToolResult
+9. 写日志
+```
+
+为什么要问：
+不能只让 ReActExecutor 校验一次。ToolManager 作为执行入口也要自保，避免测试、调试入口或未来 Runtime/API 入口绕过校验。旧顺序 Executor 不再作为正式调用来源。
+
+你的回答：采取你的建议
+
+
+### 问题 16：是否允许动态注册第三方工具？
+
+建议：
+V1 先保留能力，但不做完整插件系统。可以支持：
+
+```python
+tool_manager.register_tool(spec, instance)
+tool_manager.unregister_tool(name)
+```
+
+但动态工具必须提供 ToolSpec，必须返回 ToolResult，必须遵守 workspace / confirmation / timeout 策略。
+
+为什么要问：
+后续 MCP、插件、自定义工具都需要这个基础，但 V1 不宜做太大。
+
+你的回答：采取你的建议，但是我觉得至少可以支持添加mcp吧，可以调用mcp的工具，添加一个mcp就可以将这个添加到工具列表里面，这个是不是需要专门做一个mcp执行工具，添加一个mcp工具就往这个mcp执行工具添加这个mcp的信息和执行参数，所有的mcp工具都由这个mcp执行工具来解析和执行，也就是说除了那5个基础工具外再添加一个mcp执行工具，反正不管是什么mcp工具，他的执行逻辑不都是差不多的吗，所以使用一个统一的mcp执行工具来处理所有关于mcp工具的调用这样会不会好一些，然后新添加的mcp根据依旧放到根据列表里面，然后标注一下这是mcp工具即可，这个需要好好设计一下
+
+
+---
+
+## 5. ToolCallRequest / ToolCallContext
+
+### 问题 17：是否需要新增标准 `ToolCallRequest`？
+
+建议：
+需要。建议结构：
+
+```python
+ToolCallRequest(
+    tool_name: str,
+    args: dict,
+    context: ToolCallContext,
+    options: ToolCallOptions,
+)
+```
+
+其中 `ToolCallContext` 包含：
+
+```text
+trace_id
+execution_id
+plan_id
+step_id
+packet_id
+user_id/session_id 可选
+workspace_root
+source
+initiated_by
+```
+
+`ToolCallOptions` 包含：
+
+```text
+timeout_seconds
+dry_run
+require_confirmation
+confirmed
+allow_network
+allow_write
+allow_command
+max_output_chars
+```
+
+为什么要问：
+没有 context，就很难把 Analyzer -> Planner -> ReActExecutor -> Tool 的日志串起来。
+
+你的回答：采取你的建议，这方面的数据结构你根据实际的运转逻辑来设计字段
+
+
+### 问题 18：Tool 层是否要支持 `dry_run`（模拟执行/预览执行）？
+
+通俗解释：
+`dry_run` 表示“按照真实执行流程做参数、安全、权限、路径和影响范围检查，但最后不真正执行产生副作用的动作”。它不是绕过工具执行，而是工具在正式执行前提供一个安全预览。
+
+例如：
+
+```text
+write_file dry_run:
+  检查路径、权限、是否会覆盖、内容大小，只返回预览，不真正写文件。
+
+delete_file dry_run:
+  检查目标文件和删除范围，只返回将删除哪些文件，不真正删除。
+
+command_tool dry_run:
+  解析命令、检查 cwd、危险命令和超时配置，只返回“允许/拒绝及原因”，不启动进程。
+
+web_search dry_run:
+  检查网络策略和 provider 配置，不真正发起联网请求。
+```
+
+建议：
+支持，但只对有意义的工具启用。比如：
+
+```text
+write_file dry_run:
+  返回将写入哪个文件、是否覆盖、内容长度，不真的写
+
+delete_file dry_run:
+  返回将删除哪些文件，不真的删除
+
+command_tool dry_run:
+  只做安全校验，不执行
+
+web_search dry_run:
+  检查 provider 配置，不真实联网
+```
+
+为什么要问：
+确认流程和未来 UI 预览会用到 dry_run。
+
+你的回答：采取你的建议
+
+
+### 问题 19：Tool 层是否要区分“调用来源”？
+
+建议：
+需要。建议 `context.source` 支持：
+
+```text
+react_executor
+historical_executor
+manual_test
+api
+system
+```
+
+不同来源可以使用不同策略。比如 ReActExecutor、测试、Runtime/API 或未来 MCP 管理入口都可以标记来源，但任何来源都不能绕过高风险确认。旧顺序 Executor 不再作为正式来源。
+
+为什么要问：
+同一个工具从不同入口调用，权限和日志要求可能不同。
+
+你的回答：采取你的建议
+
+
+---
+
+## 6. 权限与确认策略
+
+### 问题 20：Tools V1 的风险等级是否沿用 low / medium / high / blocked？
+
+当前状态：
+`ToolRegistry` 已有：
+
+```text
+low
+medium
+high
+blocked
+```
+
+建议：
+沿用，并明确含义：
+
+```text
+low:
+  无副作用或只读、无网络、无敏感输出，例如 math/time/text 基础处理。
+
+medium:
+  读工作区文件、联网搜索、写非敏感新文件、解析文档。
+
+high:
+  命令执行、代码执行、覆盖文件、移动/删除文件、大范围读取、外部网络请求。
+
+blocked:
+  默认禁止，除非后续权限系统显式允许。例如格式化磁盘、删除工作区外路径、读取系统敏感目录。
+```
+
+为什么要问：
+这是 ReActExecutor confirmation 和 ToolManager 自保的共同基础。
+
+你的回答：采取你的建议
+
+
+### 问题 21：哪些工具调用必须用户确认？
+
+建议：
+V1 默认必须确认：
+
+```text
+执行命令 command_tool
+执行代码 code_executor
+删除文件 delete_file
+移动/重命名可能覆盖目标文件
+覆盖已有文件
+写入工作区外路径，一律禁止，不进入确认
+联网访问，如果全局策略要求外部网络确认
+读取大文件或敏感路径
+```
+
+默认不需要确认：
+
+```text
+math_calculator
+time_query
+text_processor
+读取明确位于工作区内且大小可控的普通文本文件
+写入新文件且路径在工作区内、非敏感目录
+web_search 如果全局 allow_network=true 且 query 不含明显敏感内容
+```
+
+为什么要问：
+太严会影响可用性，太松会有安全风险。
+
+你的回答：采取你的建议
+
+
+### 问题 22：工具层是否允许越过 workspace_root 访问文件？
+
+建议：
+V1 默认不允许。文件读取、写入、复制、移动、删除、文档解析都限制在 `workspace_root` 内。
+
+例外建议：
+V1 暂不做工作区外访问。后续如果需要，可以设计：
+
+```text
+allowed_extra_roots
+explicit_user_selected_file
+one-time permission token
+```
+
+但这不进入 Tools V1 正式范围。
+
+为什么要问：
+文件系统边界是 Tool 层最核心的安全边界之一。
+
+你的回答：采取你的建议，不过这个应该是可以通过配置来控制权限的吧，关闭权限就只能在工作区目录下进行操作，开启权限的话就可以对工作区外的东西进行操作，这个权限是不是给一个管理员权限就可以了，这个可以在执行前给用户提醒，是否授予管理员权限，用户确认后就可以执行操作，包括后续在使用命令行工具执行命令的时候有些命令也需要管理员权限才可以跑，这个也需要做用户确认
+
+
+### 问题 23：权限拒绝时由 Tool 层返回失败，还是抛异常？
+
+建议：
+返回结构化失败，不抛给业务层：
+
+```python
+ToolResult(
+    success=False,
+    code="permission_denied",
+    error_type="permission_error",
+    retryable=False,
+    message="Permission denied: ..."
+)
+```
+
+只有不可恢复的程序 bug 才允许抛异常，并由 ToolManager 捕获成 `internal_error`。
+
+为什么要问：
+ReActExecutor 需要稳定消费失败，并生成 Observation。
+
+你的回答：采取你的建议，反正失败的都需要按工程化返回结构化的结果，这样其他层也好进行处理，像这种业务错误尽量不要抛异常，如果是代码运行或者逻辑问题会自动抛异常的，这种还是需要去捕捉异常的，所以对于这种系统抛出的异常还是需要以结构化的结果去返回和处理
+
+
+---
+
+## 7. 命令行工具边界
+还有一点就是：有时候命令执行出错后返回报错信息Observation观察后模型可以根据错误信息对执行步骤做调整，调整使用正确命令后再次执行，这个需要注意，这个涉及执行器执行步骤的调整，所以这个其实和tool层和ReActExecutor 层都有关系，所以在设计的时候记得检验一下这方面的代码是否有实现，是否可以对于实现错误的命令基于报错信息重新调整。
+但是如果报错光是修改这条命令没用（比如编辑文件显示这个文件根本不存在那就需要插入一个创建文件的命令在去做编辑，其实这里还有一个问题那就是走到编辑这步其实编辑内容模型已经生成了，调整方案后再次调用模型生成创建文件的命令，然后还需要再次向模型请求获取编辑的内容因为之前的那个内容相当于丢弃了，这样消耗的token就更多了，就拿这个例子其实是整体计划有问题，应该先检查是否有这个文件，如果没有那就先检查在执行编辑命令，所以模型给的计划需要合理，计划需要往耗费最少token完成任务的方向去设计的），这个就需要模型进行判断并决断后续该怎么做，是大调整完成方案还是小调整，反正这个提示词需要很告诉模型这种情况需要处理
+以上提出的问题请联系目前执行层、Planner层、tool层的代码仔细看一下，如果目前可以避免发生这种情况那就好，如果依旧有发生的风险请设计一套解决方案。
+所以其实虽然本次是在开发tool，但其实agent层与层之间的关系其实很复杂的，所以需要综合起来进行开发设计
+
+### 问题 24：`command_tool` 是否作为 ReActExecutor 执行命令的唯一正式入口？
+
+当前要求：
+ReActExecutor 不直接执行 shell，命令必须走 Tool 层。
+
+建议：
+是。所有命令执行都必须是：
+
+```text
+ActionPacket(command/tool)
+  -> ReActExecutor 校验
+  -> command_tool
+  -> ToolResult
+  -> Observation
+```
+
+如果 ReActExecutor 里还有直接 subprocess 或 shell 调用，Tools V1 应标记为隐患并逐步清理。
+
+为什么要问：
+这是命令安全和审计的核心边界。
+
+你的回答：采取你的建议
+
+
+### 问题 25：CommandTool 是否继续默认 `shell=False`？
+
+通俗解释：
+这里的 `shell=False / shell=True` 不是“有没有权限”的意思，而是 Python/系统执行命令时是否先交给 shell 解释。
+
+```text
+shell=False:
+  直接执行一个明确的程序和参数，例如：
+  ["python", "-m", "pytest", "tests/test_x.py"]
+  优点是更容易校验、审计和限制。
+
+shell=True:
+  把整段字符串交给 cmd / PowerShell / bash 解释，例如：
+  "pytest | tee out.txt"
+  shell 会处理管道、重定向、&&、变量展开、命令替换等复杂语法。
+  优点是灵活，缺点是风险和审计难度更高。
+```
+
+建议：
+V1 不应该完全禁止复杂 shell 命令。更合理的方案是把命令工具分成两条执行通道：
+
+```text
+普通命令通道 command_tool / argv mode:
+  默认 shell=False。
+  适合 python -m pytest、git status、npm test 这类可结构化拆分的命令。
+  风险较低，仍受 workspace、timeout、日志和错误分类约束。
+
+复杂 shell 通道 shell_command_tool / shell mode:
+  使用 shell=True 或等价 shell runner。
+  支持管道、重定向、&&、环境变量展开、PowerShell/cmd/bash 特性。
+  默认 high risk。
+  默认需要用户显式确认。
+  必须先 dry_run/预检查，向用户展示将执行的命令、cwd、可能写入/删除/联网的风险。
+  必须记录结构化 logs/tools.log。
+```
+
+这样可以满足“尽量所有命令都能执行”的目标，同时避免模型在无确认情况下直接执行复杂 shell 字符串。
+
+风险原因：
+
+```text
+shell=True 会放大注入风险
+管道/重定向/变量展开/命令替换很难审计
+Windows cmd / PowerShell / bash 语义差异很大
+```
+
+因此建议：
+
+```text
+V1 默认普通命令走 shell=False。
+V1 同时设计 shell_command_tool 或 command_tool.execution_mode="shell"。
+shell 模式不默认暴露为低风险能力，必须经过风险识别、用户确认、timeout、输出截断和日志审计。
+用户确认后才开始真实执行。
+```
+
+仍然需要注意：
+即使用户希望“所有命令都可以执行”，也建议保留少数绝对阻断边界，例如明显工作区外破坏性操作、格式化磁盘、关机重启、泄露密钥、绕过权限策略等。这些不应只靠确认放行，后续可以放进安全与权限层统一决策。
+
+为什么要问：
+这决定命令工具安全基线，也决定 Tools V1 是只支持简单命令，还是支持“复杂 shell + 用户确认 + 审计”的完整命令能力。
+
+你的回答：采取你的建议，但是还是需要过滤一些危险的命令，这种危险命令直接就不需要询问用户了，直接拒绝执行，并返回执行结果，说明拒绝执行原因，这种危险命令可以通过规则去过滤，不过一般的删除命令其实不算是高风险的，顶多让用户确认一下就行了，所以命令其实需要做一个风险校验的，命令风险设定几个等级，对于最后一个等级的高风险就直接拒绝，其他的按照等级分为是否询问还是可以直接执行（当然需要用户在第一次使用agent的时候设置一个配置，为true表示低风险的比如编辑文件可以直接执行不需要询问，如果用户不开启默认为false那后续不管执行什么命令都需要用户确认是否执行）
+
+
+### 问题 26：CommandTool 是否允许管道、重定向、`&&`、`;` 等 shell 元字符？
+
+当前实现：
+已禁止部分 shell metacharacters。
+
+建议：
+普通 `command_tool / argv mode` 继续禁止 shell 元字符；复杂 shell 命令交给 `shell_command_tool / shell mode` 处理。
+
+也就是说，不是整个 Tool 层禁止管道、重定向、`&&`、`;`，而是：
+
+```text
+command_tool:
+  默认安全通道，shell=False，不允许 shell 元字符。
+
+shell_command_tool:
+  复杂命令通道，允许 shell 元字符，但 high risk、默认需要用户确认、必须日志审计。
+```
+
+允许示例：
+
+```text
+python -m pytest tests/test_x.py
+git status --short
+dir
+```
+
+普通 command_tool 禁止、但 shell_command_tool 可在确认后执行的示例：
+
+```text
+pytest | tee out.txt
+cd x && npm test
+powershell -Command ...
+```
+
+仍建议默认阻断或进入更严格安全策略的示例：
+
+```text
+del /f ...
+rm -rf ...
+format ...
+shutdown ...
+读取/上传密钥文件
+工作区外破坏性操作
+```
+
+为什么要问：
+这影响命令工具的可用性和安全性。
+
+你的回答：采取你的建议，包含复杂符号的就走shell_command_tool
+
+
+### 问题 27：哪些命令默认 blocked？
+
+建议：
+V1 默认 blocked：
+
+```text
+rm / del / erase / rmdir / rd
+format
+shutdown / reboot
+reg
+powershell / pwsh / cmd
+curl / wget 带执行或下载脚本用途
+任何指向 workspace 外路径的破坏性命令
+带 --force / /f 的破坏性命令
+```
+
+注意：
+删除文件应通过专门 `delete_file` 工具，而不是 command_tool。这样权限、确认和审计更稳定。
+
+这看起来像是多做了一个工具，但整体上反而会降低复杂度。原因是删除操作如果放在命令行里，需要解析很多系统差异和危险写法：
+
+```text
+Windows:
+  del /f a.txt
+  rd /s /q dir
+  Remove-Item -Recurse -Force ...
+
+Linux/macOS:
+  rm file
+  rm -rf dir
+  find . -delete
+```
+
+如果都交给 command_tool，Tool 层必须理解各种 shell、各种参数组合、路径展开、通配符和递归删除语义，安全判断会很难稳定。
+
+如果拆成 `delete_file`，删除语义就变成结构化参数：
+
+```json
+{
+  "path": "docs/old.md",
+  "recursive": false,
+  "confirm": true
+}
+```
+
+这样更容易做到：
+
+```text
+确认路径一定在 workspace 内
+确认删除的是文件还是目录
+确认是否递归
+确认是否匹配敏感路径
+确认是否需要用户确认
+记录删除前文件信息、大小、hash
+返回结构化 ToolResult
+写入审计日志
+```
+
+所以建议不是“为了设计而复杂化”，而是：
+
+```text
+常规删除:
+  走 delete_file / delete_files，结构化、安全、可审计。
+
+命令行删除:
+  command_tool 默认拦截 rm/del/rd。
+
+复杂脚本里确实包含删除:
+  后续交给 shell_command_tool + high risk + 用户确认 + 安全策略层判断。
+```
+
+V1 建议先做简单边界：
+
+```text
+delete_file:
+  只删除 workspace 内单个文件或明确文件列表。
+  默认需要用户确认。
+  不支持递归删除目录。
+
+command_tool:
+  默认不执行删除命令。
+```
+
+为什么要问：
+把文件破坏性操作从命令工具里拆出去，更容易做安全边界。
+
+你的回答：采取你的建议
+
+
+### 问题 28：CommandTool 的输出如何处理？
+
+建议：
+结构化返回：
+
+```json
+{
+  "command": "...",
+  "cwd": "...",
+  "exit_code": 0,
+  "stdout": "...",
+  "stderr": "...",
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "duration_ms": 1234,
+  "timeout_seconds": 30
+}
+```
+
+但用户可见 event 只展示摘要。日志中 stdout/stderr 默认截断并脱敏，避免爆日志。
+
+为什么要问：
+测试需要完整判断 exit_code，用户界面不应该被大段输出刷屏。
+
+你的回答：采取你的建议，我建议在多加一些信息字段，反正执行命令后能拿到的信息尽量都返回吧，上游总会使用到的
+
+
+---
+
+## 8. 文件工具边界
+
+### 问题 29：Tools V1 是否新增一组正式文件工具，而不是继续只用 file_writer？
+
+建议：
+需要。V1 建议新增：
+
+```text
+list_files
+find_files
+read_file
+write_file
+copy_file
+move_file
+rename_file
+delete_file
+file_info
+```
+
+其中 `document_parser` 负责“解析文档内容”，`read_file` 负责“读取普通文件文本/字节摘要”，职责不要混在一起。
+
+为什么要问：
+Agent 做项目开发时，文件读写搜索是核心能力，不能长期只靠 command_tool。
+
+你的回答：是的，需要增加一组正式文件工具，原来的file_writer就不要使用了，使用更加正式的方案来做文件读写搜索能力，之前的file_writer只不过是暂时的简单占位
+
+
+### 问题 30：文件路径统一使用 workspace-relative，还是允许绝对路径？
+
+建议：
+对 ActionPacket 和模型可见参数，推荐 workspace-relative：
+
+```json
+{
+  "path": "src/tools/base.py"
+}
+```
+
+Tool 层内部可以接受绝对路径，但必须 resolve 后确认在 workspace_root 内。ToolResult 返回时优先返回 workspace-relative path，同时 metadata 可记录 resolved path 的脱敏摘要。
+
+为什么要问：
+workspace-relative 更利于模型理解和日志脱敏，也避免泄露用户机器目录。
+
+你的回答：采取你的建议
+
+
+### 问题 31：`write_file` / 文件修改工具如何区分新建、覆盖、追加和修改？这些操作是否需要用户确认？
+
+通俗解释：
+你说的“把原来文件里的 `a` 修改成 `b`”，本质上属于“修改已有文件”。如果工具直接把整份新内容写回原文件，从文件系统角度看就是覆盖写入；如果工具只描述局部 diff/patch，则是补丁修改。
+
+因此 Tools V1 不应该靠自然语言猜测“这是新增、覆盖还是修改”。模型生成的 `ActionPacket.action_args` 里应该明确带写入模式字段，Tool 层再结合真实文件状态做校验。
+
+建议：
+正式文件写入/修改工具使用明确字段，例如：
+
+```json
+{
+  "path": "src/example.py",
+  "write_mode": "create",
+  "content": "..."
+}
+```
+
+建议 `write_mode` 支持：
+
+```text
+create:
+  只允许新建文件。目标已存在则失败 file_exists。
+
+overwrite:
+  用 content 替换整个已有文件。目标不存在时是否允许创建，需要配置或额外字段控制。
+
+append:
+  在文件末尾追加内容。
+
+patch:
+  按 diff/search_replace/insert_before/insert_after/patch_blocks 做局部编辑。
+  包括局部替换、局部插入、局部删除，不覆盖整份文件。
+
+create_or_overwrite:
+  允许不存在时创建，存在时覆盖。风险更高，不建议模型默认使用。
+```
+
+模型 ActionPacket 示例：
+
+```json
+{
+  "action_type": "call_tool",
+  "action_target": "write_file",
+  "action_args": {
+    "path": "docs/summary.md",
+    "write_mode": "overwrite",
+    "content": "新的完整内容",
+    "reason": "根据用户要求更新摘要文件"
+  },
+  "requires_confirmation": true,
+  "confirmation_type": "file_overwrite"
+}
+```
+
+如果是局部修改，建议后续使用 `patch_file` 或 `edit_file`，而不是让 `write_file` 模糊处理：
+
+```json
+{
+  "action_type": "call_tool",
+  "action_target": "patch_file",
+  "action_args": {
+    "path": "src/app.py",
+    "patch_mode": "search_replace",
+    "replacements": [
+      {
+        "old": "a",
+        "new": "b"
+      }
+    ],
+    "reason": "按用户要求替换变量值"
+  },
+  "requires_confirmation": true,
+  "confirmation_type": "file_modify"
+}
+```
+
+确认策略建议：
+
+```text
+如果用户没有开启总的写入/修改自动授权开关:
+  create 新文件:
+    可根据策略不确认或低风险确认。
+  overwrite 覆盖已有文件:
+    必须确认。
+  append 追加已有文件:
+    建议确认，至少对代码/配置/敏感文件确认。
+  patch/edit 修改已有文件:
+    必须确认。
+  写入敏感文件:
+    high 或 blocked，例如 .env、密钥文件、.git 内部文件。
+
+如果用户开启了总的写入/修改自动授权开关:
+  workspace 内普通文件的 create/overwrite/append/patch 可以默认执行。
+  但敏感文件、工作区外路径、删除、递归操作、危险配置仍然需要确认或阻断。
+```
+
+这里的“总的权限开关”可以设计为：
+
+```text
+tools.file_write.auto_approve_create
+tools.file_write.auto_approve_modify
+tools.file_write.auto_approve_overwrite
+tools.file_write.auto_approve_append
+tools.file_write.require_confirmation_for_sensitive_paths
+```
+
+判断来源建议：
+
+```text
+1. 模型通过 ActionPacket.action_args.write_mode / patch_mode 明确声明意图。
+2. ToolRegistry 用 ToolSpec schema 校验字段是否合法。
+3. Tool 层检查真实文件状态：文件是否存在、是否目录、是否敏感路径、是否 workspace 内。
+4. ReActExecutor / 安全策略根据 write_mode + 文件状态 + 用户权限开关决定是否需要确认。
+5. Tool 层执行前再次校验，不能只相信模型声明。
+```
+
+为什么要问：
+覆盖文件和修改已有文件都是常见副作用。必须让模型在结构化指挥数据里明确动作模式，再由 Tool 层用真实文件状态校验，避免靠自然语言猜测导致误写、误覆盖或绕过确认。
+
+你的回答：采取你的建议
+
+
+### 问题 32：`delete_file` 是否只能删除文件，V1 不删除目录？
+
+建议：
+V1 只支持删除单个文件或明确文件列表，不做递归删除目录。目录删除、批量删除、大范围 glob 删除都放到后续版本。
+
+如果确实需要删除目录，建议后续单独做 `delete_directory`，默认 blocked/high，并要求用户明确确认目标路径。
+
+为什么要问：
+递归删除风险太高，不适合第一版工具正式化。
+
+你的回答：目前只支持删除文件，目录不支持删除，用户如果有相关要求或者模型给出的执行步骤或者工具调用涉及到删除目录就拦截并进行提示
+
+
+### 问题 33：文件读取是否需要大小限制？
+
+建议：
+需要。默认：
+
+```text
+普通 read_file:
+  最大 1 MB 文本内容
+  超过则返回 file_too_large，并建议使用 read_file_chunk
+
+document_parser:
+  最大 10-20 MB，按格式区分
+
+list_files/find_files:
+  最大返回条数，例如 200 或 500
+```
+
+可预留后续工具：
+
+```text
+read_file_chunk
+read_file_head
+read_file_tail
+```
+
+为什么要问：
+避免大文件撑爆模型上下文、日志和内存。
+
+你的回答：采取你的建议，需要按照大小分等级，根据不同的等级使用不同的读取策略
+
+
+### 问题 34：文件工具是否需要保护敏感路径？
+
+建议：
+需要。默认敏感路径：
+
+```text
+.env
+*.pem
+*.key
+*.p12
+id_rsa
+credentials*
+secrets*
+.git/
+node_modules/ 大规模读取
+__pycache__/
+.venv/
+```
+
+策略建议：
+
+```text
+读取敏感文件:
+  high risk，需要确认或默认拒绝，视后续安全策略。
+
+写入敏感文件:
+  high risk，需要确认。
+
+删除敏感文件:
+  blocked 或 high + 明确确认。
+```
+
+为什么要问：
+工具层是最后一道本地资源安全边界。
+
+你的回答：采取你的建议
+
+
+---
+
+## 9. 文档解析工具
+
+### 问题 35：DocumentParser V1 支持哪些格式？
+
+建议：
+V1 一等支持：
+
+```text
+txt
+md
+json
+csv
+pdf
+docx
+xlsx
+```
+
+返回结构：
+
+```json
+{
+  "path": "docs/a.pdf",
+  "format": "pdf",
+  "text": "...",
+  "metadata": {
+    "pages": 10,
+    "size_bytes": 12345,
+    "parser": "pypdf"
+  },
+  "tables": [],
+  "warnings": []
+}
+```
+
+为什么要问：
+后续 RAG / 文档问答 / 项目分析都会依赖这个边界。
+
+你的回答：采取你的建议，平时涉及到RAG的也差不多就只有这些文件格式
+
+
+### 问题 36：DocumentParser 是否负责总结文档？
+
+建议：
+不负责。DocumentParser 只负责解析和抽取结构化内容；总结由 ReActExecutor 后续调用 Models 层或 TextProcessor 完成。
+
+原因：
+解析工具应返回事实材料；总结是模型任务。如果混在一起，工具结果会变得不可审计。
+
+为什么要问：
+这和联网搜索工具“只负责找资料，后续再总结”的原则一致。
+
+你的回答：采取你的建议
+
+
+### 问题 37：解析失败如何返回？
+
+建议：
+结构化失败：
+
+```python
+ToolResult(
+    success=False,
+    code="parse_failed",
+    error_type="runtime_error",
+    data={
+        "path": "docs/a.pdf",
+        "format": "pdf",
+        "parser": "pypdf"
+    },
+    error="PDF parse failed: ..."
+)
+```
+
+不建议把异常文本作为普通成功内容返回。
+
+为什么要问：
+Planner/ReActExecutor 需要知道失败类型，决定是否换工具、询问用户或终止。
+
+你的回答：采取你的建议
+
+
+---
+
+## 10. 联网搜索工具方案
+
+### 问题 38：是否将联网搜索正式工具命名为 `web_search`，并兼容旧 `search_tool`？
+
+当前状态：
+已有 `search_tool`，描述为 Bing web search。
+
+建议：
+V1 正式名称使用 `web_search`，旧 `search_tool` 作为 alias 兼容一段时间：
+
+```text
+web_search:
+  正式工具名，进入 ToolSpec 和模型可见工具列表。
+
+search_tool:
+  legacy alias，内部转发到 web_search。
+```
+
+为什么要问：
+`web_search` 更准确表达能力，也避免绑定 Bing。
+
+你的回答：可以，采取你的建议
+
+
+### 问题 39：是否采用统一 provider adapter 方案，而不是写死某个搜索厂商或某个联网模型？
+
+建议：
+采用统一 provider adapter。正式结构：
+
+```text
+WebSearchTool
+  -> search_api provider
+     例如 Bing / Tavily / SerpAPI / 自建搜索
+  -> model_builtin provider
+     例如 OpenAI GPT web_search / Kimi 联网 / DeepSeek 联网 / 其他支持联网的模型
+  -> disabled / not_configured
+```
+
+ReActExecutor 只调用 `web_search`，不关心具体是 GPT、Kimi、DeepSeek、Bing 还是其他 provider。
+
+为什么要问：
+这样以后换 provider 不会影响 ActionPacket、ReActExecutor 和 ToolResult 协议。
+
+你的回答：是的，采取你的建议
+
+
+### 问题 40：联网搜索默认 provider 如何选择？
+
+建议：
+使用配置决定，不让模型自行选择：
+
+```text
+tools.web_search.provider = "auto" | "search_api" | "model_builtin" | "disabled"
+```
+tools.web_search.provider = "auto":
+      1. Tavily Search API
+      2. model_builtin_search
+      3. 返回 search_not_configured
+第一阶段只需要申请 Tavily API key，就能免费把标准联网搜索能力跑起来
+
+建议默认：
+
+```text
+auto:
+  优先 search_api provider
+  如果 search_api 未配置，再使用 model_builtin provider
+  如果都未配置，返回 search_not_configured
+```
+这个我感觉还是做一个配置化吧，默认的就是auto，也可以选择优先使用model_builtin provider，这个不行那就在使用search_api provider，都不行返回search_not_configured，这个最好灵活可控
+原因：
+search_api 通常能返回更可审计的原始结果；model_builtin 能快速利用已有模型联网能力，但证据质量取决于 provider。
+
+为什么要问：
+这决定短期能不能先利用 GPT/Kimi/DeepSeek 联网能力，同时给长期可审计搜索留接口。
+
+你的回答：采取你的建议
+
+
+### 问题 41：model_builtin_search 调用哪个模型，是否通过 Models 层配置决定？
+
+建议：
+通过 Models 层配置决定，不在 SearchTool 里写死。
+
+建议配置：
+
+```text
+tools.web_search.model_builtin.provider_conf_id = "conf_openai_default"
+tools.web_search.model_builtin.model = "具体支持联网搜索的模型"
+tools.web_search.model_builtin.enable_web_search = true
+tools.web_search.model_builtin.timeout_seconds = 30
+```
+
+调用方式：
+
+```text
+WebSearchTool
+  -> Models 层
+  -> 指定 provider_conf_id / model / call_type = web_search
+  -> 在 ModelCallOptions 或 provider-specific options 中开启联网搜索参数
+```
+
+注意：
+不同 provider 开启联网搜索的参数不同。OpenAI、Kimi、DeepSeek 或其他兼容服务都应由 Models/provider adapter 处理具体参数，SearchTool 只传递“需要联网搜索”这个意图。
+
+为什么要问：
+这能避免 Tool 层重新实现一套模型 provider 系统。
+
+你的回答：采取你的建议，注意在设计的时候去联网搜索一下不同模型开启联网搜索是需要添加哪一个参数，参数值需要如何配置，还有就是使用模型联网搜索时需要设计好模型返回的结构，这样agent也比较好解析，可以生成总结性的自然语言，但是这个自然语言最好也加到结构化字段中，反正不管是模型联网搜索还是使用bing搜索都需要返回agent可以解析并且消费的结构化数据
+
+
+### 问题 42：不管 search_api 还是 model_builtin，是否都统一归一化成同一个 `WebSearchData`？
+
+建议：
+必须统一。建议结构：
+
+```json
+{
+  "query": "搜索词",
+  "provider": "openai",
+  "provider_type": "model_builtin",
+  "mode": "model_builtin_search",
+  "results": [
+    {
+      "title": "网页标题",
+      "url": "https://example.com",
+      "snippet": "摘要或引用片段",
+      "source": "example.com",
+      "published_at": null,
+      "retrieved_at": "2026-08-11T12:00:00+08:00",
+      "rank": 1,
+      "metadata": {}
+    }
+  ],
+  "provider_summary": "如果 provider 返回了总结，放这里",
+  "evidence_level": "search_api",
+  "warnings": []
+}
+```
+
+建议 `provider_type`：
+
+```text
+search_api
+model_builtin
+```
+
+建议 `mode`：
+
+```text
+search_results
+model_builtin_search
+model_builtin_summary
+not_configured
+```
+
+建议 `evidence_level`：
+
+```text
+search_api
+model_cited
+model_summary_with_urls
+weak
+none
+```
+
+为什么要问：
+统一 `data` 结构后，上层不用关心 provider 差异。
+
+你的回答：采取你的建议，具体设计这块的时候记得根据实际上层需求的结构来调整你建议里面的结构和字段
+
+
+### 问题 43：模型内置联网返回结果是否需要提示词模板和 JSON schema 校验？
+
+建议：
+需要。model_builtin provider 调用模型时，应使用固定提示词模板要求模型输出 JSON：
+
+```json
+{
+  "query": "...",
+  "results": [
+    {
+      "title": "...",
+      "url": "...",
+      "snippet": "...",
+      "source": "...",
+      "published_at": null
+    }
+  ],
+  "provider_summary": "...",
+  "warnings": []
+}
+```
+
+Tool 层拿到模型结果后必须：
+
+```text
+1. 解析 JSON
+2. 校验 schema
+3. 校验 URL 字段是否存在且格式合理
+4. 归一化字段
+5. 对缺失证据降级 evidence_level
+6. 保留 warnings
+```
+
+如果模型只返回总结，没有 URL，不能伪装成真实搜索结果。
+
+为什么要问：
+模型联网输出本质还是模型生成内容，需要二次校验。
+
+你的回答：需要，采取你的建议，模型返回的肯定必须是结构化agent可以解析并消费的东西，不然自然语言agent也消费不了啊
+
+
+### 问题 44：web_search 工具是否负责总结搜索结果？
+
+建议：
+不负责。`web_search` 只负责找资料和返回证据。总结应由后续模型步骤完成：
+
+```text
+web_search
+  -> 返回 WebSearchData
+ReActExecutor
+  -> 生成 Observation
+  -> 如果需要总结，再 call_model
+```
+
+例外：
+如果 model_builtin provider 天然返回 summary，可以放入 `provider_summary`，但这只是 provider 附带信息，不是 SearchTool 的核心职责。
+
+为什么要问：
+搜索和总结分离，才能保持工具结果可审计。
+
+你的回答：是的，联网搜索工具只负责将东西搞到手，至于后续怎么消费工具不需要管
+
+
+### 问题 45：没有 URL 但有模型联网总结时，web_search 算成功还是失败？
+
+建议：
+算“降级成功”或“部分成功”，但必须标记证据弱：
+
+```python
+ToolResult(
+    success=True,
+    code="ok_with_warnings",
+    data={
+        "results": [],
+        "provider_summary": "...",
+        "evidence_level": "weak",
+        "warnings": ["provider_returned_summary_without_verifiable_urls"]
+    }
+)
+```
+
+如果用户任务明确要求“列出来源/链接/可审计证据”，则 ReActExecutor 应视为不满足目标，继续尝试 search_api 或询问用户配置搜索 API。
+
+为什么要问：
+这决定 model_builtin 搜索的验收标准。
+
+你的回答：这个标记一下吧，也算是成功吧，这样的就直接消费模型联网搜索的总结就行了呗，反正联网搜索的每一个网站的内容都必须返回这样我的agent就可以间接的获取不同网页的信息了，这个模型可以对每一个网页做概述总结，但是核心的东西不能丢，比如解决方案、代码等等，这样在agent得到这些网页数据后可以再次调用模型进行整理在做后续的规划从而实现参考网页来完成任务，后续的执行步骤也是参考网页给出的解决方案的
+
+
+### 问题 46：web_search 是否需要缓存？
+
+建议：
+V1 可以先不做持久缓存，只预留字段：
+
+```text
+cache_key
+cache_hit
+retrieved_at
+ttl_seconds
+```
+
+如果实现轻量缓存，建议默认仅进程内短 TTL，例如 5-30 分钟，避免频繁付费/联网。但不要让缓存影响“最新信息”任务，涉及 latest/today/价格/法规时应允许 bypass_cache。
+
+为什么要问：
+联网搜索有成本、延迟和时效性，缓存策略会影响答案新鲜度。
+
+你的回答：采取你的建议
+
+
+### 问题 47：web_search 是否和网页正文抓取工具分离？
+
+建议：
+分离。
+
+```text
+web_search:
+  搜索，返回标题、URL、snippet、source、rank。
+
+fetch_url / read_web_page:
+  读取指定 URL 正文，返回正文、状态码、content_type、截断信息。
+```
+
+V1 可以先只做 `web_search`，`fetch_url` 作为后续工具预留。原因是网页抓取涉及 robots、反爬、编码、HTML 清洗、安全过滤和更复杂的网络边界。
+
+为什么要问：
+搜索 API 和网页抓取是两种不同能力，不宜混成一个工具。
+
+你的回答：采取你的建议
+
+
+---
+
+## 11. 工具与 Models 层的关系
+
+### 问题 48：哪些工具可以调用 Models 层？
+
+建议：
+V1 默认大多数工具不调用 Models 层。只有明确需要模型能力的工具可以通过 Models 层调用：
+
+```text
+允许:
+  web_search 的 model_builtin provider
+  translator 如果后续从 mock 升级为模型翻译
+  text_processor 如果后续做模型摘要/改写
+
+不允许:
+  command_tool
+  file tools
+  document_parser
+  math_calculator
+  time_query
+```
+
+但要注意：即使工具内部调用 Models 层，也必须返回 ToolResult；模型结果不能直接冒充工具结果。
+
+为什么要问：
+避免 Tools 和 Models 互相缠绕，也防止模型绕过 ReActExecutor。
+
+你的回答：采取你的建议
+
+
+### 问题 49：工具调用 Models 层时，是否必须使用 Models V1 的结构化结果？
+
+建议：
+必须。比如 web_search 的 model_builtin provider：
+
+```text
+ModelManager.generate_json(...)
+  -> StructuredModelResult
+  -> SearchTool 校验/归一化
+  -> ToolResult<WebSearchData>
+```
+
+如果模型失败：
+
+```text
+ModelCallResult.success=False
+  -> ToolResult.success=False
+  -> code="provider_error" 或 "model_builtin_search_failed"
+```
+
+为什么要问：
+Models V1 已经完成，Tools 不应该重新做裸字符串模型调用。
+
+你的回答：采取你的建议
+
+
+### 问题 50：工具层是否允许模型 provider 的“内置工具调用”直接执行本地工具？
+
+建议：
+不允许。外部模型 provider 即使支持 tool calling，也只能用于生成结构化建议或 JSON；不能把本地 ToolRegistry 暴露给 provider 让它远程决定并执行。
+
+原因：
+本地工具有文件、命令、网络等安全边界，必须由 ReActExecutor 和 Tool 层本地校验。
+
+为什么要问：
+OpenAI/Kimi/其他 provider 可能支持 tool calling，但本项目的执行权不能交给远端模型。
+
+你的回答：采取你的建议
+
+
+---
+
+## 12. 用户可见 events 与开发 logs
+
+### 问题 51：Tools V1 是否新增 `logs/tools.log` JSONL？
+
+建议：
+需要。和 Models 层 `logs/models.log` 类似，Tools 层应记录结构化工具调用日志。
+
+建议每行 JSONL 字段：
+
+```text
+timestamp
+trace_id
+execution_id
+plan_id
+step_id
+packet_id
+tool_call_id
+tool_name
+provider
+success
+code
+error_type
+retryable
+duration_ms
+timeout_seconds
+risk_level
+requires_confirmation
+confirmed
+workspace_scope
+input_summary
+output_summary
+stdout_truncated / content_truncated
+metadata
+```
+
+为什么要问：
+Tools 层正式化后，排查执行问题不能只靠用户可见 event。
+
+你的回答：采取你的建议，这个涉及到日志和面向用户展示的执行过程、工具调用日志，调用结果等等
+
+
+### 问题 52：logs/tools.log 是否记录完整文件内容、完整命令输出或完整网页内容？
+
+建议：
+默认不记录。只记录摘要、长度、hash、截断内容和必要路径。
+
+建议：
+
+```text
+文件内容:
+  content_length / content_hash / preview 可选
+
+命令输出:
+  stdout/stderr 截断，例如 4000 chars
+
+网页搜索:
+  query、URL、title、snippet 可记录
+  不记录完整正文，除非 fetch_url 工具后续明确允许
+
+敏感字段:
+  api_key/password/token/secret 等必须脱敏
+```
+
+为什么要问：
+日志是开发排查工具，不应变成敏感数据仓库。
+
+你的回答：采取你的建议
+
+
+### 问题 53：用户可见 ExecutionEvent 展示哪些工具信息？
+
+建议：
+用户可见 event 只展示简短、可理解、安全的状态：
+
+```text
+开始调用工具：web_search
+搜索完成：找到 5 条结果
+命令执行完成：exit_code=0
+文件已写入：src/a.py
+工具失败：search_not_configured，需要配置搜索服务
+```
+
+不直接展示：
+
+```text
+完整命令 stdout/stderr
+完整文件内容
+API key / headers
+内部 stack trace
+完整 raw_response
+```
+
+为什么要问：
+这保持“用户体验层”和“开发观测层”分离。
+
+你的回答：采取你的建议，反正你参考前面我给的codex运行的示例来设计需要记录的信息数据，以及ExecutionEvent
+
+
+---
+
+## 13. 基础工具范围
+
+### 问题 54：Tools V1 正式基础工具范围是否按下面列表？
+
+建议：
+V1 正式工具分三类。
+
+一等正式工具：
+
+```text
+math_calculator
+time_query
+text_processor
+web_search
+read_file
+write_file
+list_files
+find_files
+file_info
+document_parser
+command_tool
+```
+
+受限/高风险工具：
+
+```text
+copy_file
+move_file
+rename_file
+delete_file
+code_executor
+```
+
+兼容/后续增强：
+
+```text
+search_tool -> web_search alias
+translator -> V1 可保留 mock 或转为 text_processor/model-backed 工具
+```
+
+为什么要问：
+这决定 Tools V1 的开发工作量和验收范围。
+
+你的回答：采取你的建议
+
+
+### 问题 55：`code_executor` 是否继续默认关闭？
+
+建议：
+继续默认关闭。代码执行风险比命令执行更复杂，V1 可以保留现有工具但不作为默认可用工具暴露给模型，除非配置显式开启并要求确认。
+
+建议：
+
+```text
+enabled=false by default
+risk_level=high
+requires_confirmation=true
+timeout 默认 10 秒
+禁止文件系统写入或限制临时目录
+```
+
+为什么要问：
+Agent 已经可以通过 command_tool 运行测试，没必要在 V1 早期扩大代码执行风险。
+
+你的回答：采取你的建议
+
+
+### 问题 56：translator 是保留 mock，还是升级成模型工具？
+
+建议：
+V1 可以先保留 mock/简单占位，不作为核心验收项。后续如果升级，应通过 Models 层调用：
+
+```text
+translator
+  -> ModelManager.generate(...)
+  -> ToolResult<TranslationData>
+```
+
+但不要在 Tools V1 第一阶段把它变成重点，因为命令、文件、搜索和文档解析优先级更高。
+
+为什么要问：
+决定是否把有限开发精力放在核心 agent 能力上。
+
+你的回答：采取你的建议，设计的时候做详细一些
+
+
+---
+
+## 14. 配置中心
+
+### 问题 57：Tools 配置是否需要独立目录 `config/tools/`？
+
+建议：
+需要。类似 Models 层配置中心，Tools 层建议：
+
+```text
+config/tools/
+  tools_config.json
+  tool_specs.json
+  tool_policies.json
+  providers.json
+```
+
+V1 也可以先把默认配置写在代码里，同时预留配置加载器。正式化目标是逐步让风险、timeout、provider、enabled 状态可配置。
+
+为什么要问：
+ToolSpec、权限策略和 provider key 不应该长期散落在代码里。
+
+你的回答：需要，采取你的建议，设计的时候做详细一些
+
+
+### 问题 58：工具是否支持 enabled/disabled 状态？
+
+建议：
+支持。每个工具至少有：
+
+```text
+enabled
+risk_level
+requires_confirmation
+timeout_seconds
+max_output_chars
+workspace_scope
+```
+
+工具禁用时返回：
+
+```python
+ToolResult(success=False, code="tool_disabled")
+```
+
+ReActExecutor 给模型的工具列表也不应包含 disabled 工具，除非需要提示“不可用原因”。
+
+为什么要问：
+后续用户可能希望禁用命令、联网、写文件等能力。
+
+你的回答：采取你的建议，设计的时候做详细一些
+
+
+### 问题 59：网络工具是否受全局 allow_network 控制？
+
+建议：
+是。建议配置：
+
+```text
+tools.allow_network = true/false
+tools.network.requires_confirmation = true/false
+```
+
+当 `allow_network=false` 时：
+
+```text
+web_search -> network_not_allowed
+fetch_url -> network_not_allowed
+其他外部 provider 工具 -> network_not_allowed
+```
+
+为什么要问：
+联网搜索、网页抓取、第三方 API 调用都需要统一网络边界。
+
+你的回答：采取你的建议，设计的时候做详细一些
+
+
+---
+
+## 15. ReActExecutor 调用 Tool 的方式
+
+### 问题 60：ReActExecutor 是否继续负责 ActionPacket 业务校验，Tools 只做工具级校验？
+
+建议：
+是。分工：
+
+```text
+ReActExecutor:
+  ActionPacket schema 校验
+  action_type 是否允许
+  当前 step 是否匹配
+  confirmation 流程
+  Observation 生成
+  Checker 状态转移
+
+Tools:
+  tool_name 是否存在
+  args 是否符合 ToolSpec
+  workspace/risk/timeout/tool enabled 校验
+  真实执行
+  ToolResult 返回
+```
+
+为什么要问：
+避免把 ReActExecutor 的执行循环逻辑下沉到 Tools。
+
+你的回答：是在，这本来就是不同层的不同职责，采取你的建议
+
+
+### 问题 61：工具调用失败后，由谁决定 retry / fallback？
+
+建议：
+分层处理：
+
+```text
+Tool 内部:
+  可以对 provider 瞬时错误做小范围 retry，比如 web_search provider timeout。
+
+ToolManager:
+  负责执行级 timeout 和统一错误包装。
+
+ReActExecutor:
+  根据 ToolResult.retryable / code / checker 决定是否重试整个 action、换工具、询问用户或终止。
+```
+
+为什么要问：
+有些 retry 应该在工具 provider 内部完成，有些应由执行器根据任务上下文决定。
+
+你的回答：采取你的建议，分层来retry
+
+
+### 问题 62：Observation 中是否只放 ToolResult 的摘要，不放完整 raw_output？
+
+建议：
+不建议简单定成“永远只放摘要”或者“永远放全量”。更合理的是按规划等级和任务需要决定 Observation 粒度。
+建议把 Observation 分成三级：
+```text
+minimal:
+  只放状态、code、关键字段、是否成功、少量标识信息
+standard:
+  关键字段 + 受控 preview + 少量结构化内容
+full:
+  明确需要全文参与后续推理时才允许，且仍要受长度、敏感信息和上下文预算限制
+```
+推荐决策原则：
+```text
+1. 先看当前步骤的规划等级
+2. 再看这个步骤后续是否必须依赖全文内容
+3. 再看内容是否敏感、是否过长、是否容易结构化
+4. 最后决定 minimal / standard / full
+```
+可以按下面思路落地：
+```text
+低风险、偏流程型步骤
+  -> minimal
+  例如：确认状态、文件是否存在、命令是否成功、工具是否可用
+普通读写或搜索步骤
+  -> standard
+  例如：read_file、web_search、document_parser、普通命令输出
+需要逐字依赖内容的步骤
+  -> full 或 chunk 化
+  例如：精确修改、代码定位、对比差异、抽取原文证据
+高风险或敏感内容
+  -> minimal 或 standard，优先不把全文放进 Observation
+```
+建议 Planner 或 ReActExecutor 在规划阶段明确标注：
+```text
+observation_mode = "minimal" | "standard" | "full"
+```
+这样执行器就不需要猜，能按规划等级和上下文预算决定是否展示全文、预览还是关键字段。
+模型摘要不应默认参与 Observation 生成。只有在任务明确需要“总结内容”时，才由 ReActExecutor 单独发起模型步骤，而不是每次工具返回后都再走一次模型摘要。
+举例：
+```text
+用户只是想知道文件改没改成功
+  -> minimal
+用户要看搜索结果关键证据
+  -> standard
+用户要根据全文做精确修改
+  -> full 或 chunk
+用户要总结长文档
+  -> 先工具读取，再由模型单独总结，不是 Observation 自动调用模型
+```
+Observation 的目标不是保存原始输出，而是为下一步推理提供受控视图。
+建议它应包含：
+```text
+tool_name
+success
+code
+message
+observation_mode
+data_summary
+important structured fields
+raw_ref 或 artifact_ref（可选）
+```
+其中 `raw_ref` 或 `artifact_ref` 只保存引用，不默认把完整 raw_output 塞进模型上下文。
+```text
+tool_name
+success
+code
+message
+data_summary
+important structured fields
+```
+
+不直接放：
+
+```text
+完整大文件内容
+完整命令 stdout/stderr
+完整网页正文
+raw provider response
+```
+
+如果模型后续确实需要大内容，应由 ReActExecutor 明确选择读取 chunk 或传递受控摘要。
+
+为什么要问：
+Observation 会进入模型上下文，必须控制大小和敏感信息。
+
+你的回答：采取你的建议
+
+
+---
+
+## 16. 测试与验收步骤
+
+### 问题 63：Tools V1 单元测试优先覆盖哪些？
+
+建议按“先协议、再调度、再各工具族、最后集成”的顺序覆盖：
+
+```text
+1. 协议底座
+   ToolResult 外壳字段和 to_dict/to_text 兼容
+   ToolResult 失败不伪装成成功
+   ToolResult 的 error_code / retryable / trace 字段可透传
+   Observation 只消费受控摘要，不默认塞入 raw_output
+
+2. ToolRegistry
+   ToolSpec 参数校验
+   必填参数缺失识别
+   类型校验和 required_any_of 校验
+   只暴露 enabled 工具给模型
+   工具别名与正式名兼容
+
+3. ToolManager
+   执行前调用 registry 校验
+   tool 不存在 / 无 run 方法 / 参数非法时返回结构化失败
+   捕获异常并返回 internal_error
+   trace_id / execution_id / step_id 传播
+   logs/tools.log JSONL 写入
+   dry_run 不产生副作用
+
+4. 命令工具
+   workspace cwd 边界
+   shell metacharacters 拦截
+   危险命令拦截
+   超时控制
+   exit_code 传递
+   stdout/stderr 截断
+   shell=False 和 shell=True 两条路径的安全边界
+   high risk 命令需要确认时的返回结构
+
+5. 文件工具
+   路径限制在 workspace 内
+   大小限制和分段读取策略
+   敏感路径拦截
+   覆盖确认
+   新建 / 覆盖 / 追加 / 局部修改的模式识别
+   删除文件与目录删除的边界
+
+6. DocumentParser
+   txt/md/json/csv/pdf/docx/xlsx 成功场景
+   格式不支持时的失败场景
+   大文件超限场景
+   解析失败的结构化返回
+
+7. web_search
+   未配置时 search_not_configured
+   search_api provider 归一化 WebSearchData
+   model_builtin provider 结构化 JSON 校验和证据降级
+   network_not_allowed 策略
+   provider timeout / 失败 / 空结果场景
+
+8. 执行器接入
+   ReActExecutor 工具 action 仍通过 ToolRegistry / ToolManager
+   ReActExecutor 不直接执行 shell
+   Observation 由执行器根据真实 ToolResult 生成
+   确认旧顺序 Executor 不作为 Tools V1 正式调用链路
+
+9. 集成与回归
+   最低限度的 end-to-end 工具调用链路
+   真实联网搜索测试默认跳过
+   真实 provider 测试在显式开关下才执行
+   失败码、日志、确认和事件流回归
+```
+
+为什么要问：
+测试范围决定开发步骤是否能小步验收。
+
+你的回答：采取你的建议
+
+
+### 问题 64：真实联网搜索集成测试是否默认跳过？
+
+建议：
+默认跳过。规则：
+
+```text
+无搜索 API key -> skip
+未显式启用真实联网工具测试 -> skip
+有 key 且 RUN_TOOL_INTEGRATION_TESTS=true -> 执行
+```
+
+model_builtin_search 真实测试也需要：
+
+```text
+有模型 API key
+配置了支持联网搜索的 provider/model
+RUN_TOOL_INTEGRATION_TESTS=true
+```
+
+普通单元测试使用 fake provider，不访问真实网络。
+
+为什么要问：
+避免 CI 和本地测试被网络、额度、搜索结果波动影响。
+
+你的回答：这个默认跳过，但是代码需要完成且确保逻辑无误
+
+
+### 问题 65：Tools V1 开发步骤是否按下面顺序推进？
+
+建议采用下面的阶段顺序，但这只是当前设计阶段的高层开发路线图，不是后续可直接照抄执行的最终开发步骤。
+在正式开始写代码前，必须先根据本轮和后续问答形成 `Tools层设计决策汇总.md`；再把每个阶段拆成更小的、可独立验收的 Step，明确：
+```text
+本 Step 的目标和边界
+涉及哪些文件和旧代码兼容点
+数据结构和错误码
+需要补充的单元测试 / fake provider / 集成测试
+验收命令和预期结果
+完成后要回写的进度文档
+```
+后续每完成一个可验收 Step，都要修改代码、运行相关测试，并更新 `Tools层开发步骤与进度.md`。不能把下面任一阶段一次性做成大改动。
+当前建议的阶段顺序：
+```text
+Step 1：ToolResult V1 协议底座
+  扩展 ToolResult、错误码、ToolCallRequest、ToolCallContext、ToolCallOptions。
+  明确统一外壳和不同工具独立 data schema 的关系。
+  明确 raw_output、受控 preview、artifact_ref 和 Observation 分级的边界。
+Step 2：ToolRegistry / ToolManager 职责正式化
+  ToolSpec 成为模型可见工具声明、schema、风险和确认策略的统一来源。
+  ToolManager 可以保留 run_tool 方法名作为迁移入口，但内部统一转为正式请求和校验流程；不保留旧 ToolManager 执行逻辑。
+  为动态注册和 MCP 工具预留正式入口。
+Step 3：logs/tools.log 与事件边界
+  增加 JSONL 工具日志、trace 传播、脱敏和输出截断。
+  用户可见 event 只消费受控说明；Observation 按 minimal / standard / full 规划等级生成。
+Step 4：CommandTool V1 加固
+  完成普通 command_tool 的 argv / shell=False 通道。
+  完成复杂 shell_command_tool 或 execution_mode=shell 的受控通道。
+  支持危险命令阻断、确认、dry_run、workspace、timeout、输出截断、错误分类和测试。
+Step 5：文件工具 V1
+  实现 read/list/find/info/write/copy/move/rename/delete。
+  明确 create / overwrite / append / patch 等写入模式。
+  patch 支持局部替换、局部插入和局部删除；删除只支持文件，不支持递归目录删除。
+  严格执行 workspace、敏感路径、大小分级读取、总授权和逐次确认策略。
+Step 6：DocumentParser V1
+  支持 txt/md/json/csv/pdf/docx/xlsx，结构化 DocumentParseData。
+  与普通 read_file 保持职责分离，并限制解析大小、敏感内容和输出体积。
+Step 7：web_search V1 协议和 provider adapter
+  新增 web_search，search_tool alias，统一 WebSearchData。
+  provider 路由支持 auto / search_api / model_builtin / disabled，并通过配置决定优先级。
+Step 8：web_search search_api provider
+  首先接入选定的 search_api provider，例如 Tavily；后续可扩展 Brave 等 provider。
+  不把已退役的 Bing Search API 作为 V1 正式依赖。
+  返回可审计的结构化 results、URL、来源和证据字段。
+Step 9：web_search model_builtin provider
+  通过 Models 层调用支持联网搜索的模型，结构化提示词、schema 校验、证据降级。
+  具体使用 GPT、Kimi、DeepSeek 或其他模型，由 Models 层配置和 provider adapter 决定。
+  Tools 层只表达“需要联网搜索”，不重做模型 provider 或把厂商参数硬编码在工具中。
+Step 10：MCP 扩展工具 V1
+  实现 MCP Server 配置、工具发现、动态 ToolSpec 注册和统一 MCPToolGateway。
+  模型看到独立的 mcp.<server_id>.<tool_name> 工具，底层由统一 MCP 执行网关调用。
+  接入 timeout、白名单、风险、确认、ToolResult 归一化、日志和 fake MCP 测试。
+Step 11：工具配置与策略
+  初步支持 config/tools 的 enabled、allow_network、timeout、risk、confirmation 和 provider 路由。
+  保持“模型作为大脑，规则作为边界”：配置和策略只约束权限与执行，不替代模型决策。
+Step 12：ReActExecutor 正式链路验收
+  确认主链路仍稳定，命令必须通过 Tool 层，Observation 来自真实 ToolResult。
+  确认 ActionPacket 只能调用当前 ToolRegistry 暴露的工具，MCP 工具也走相同边界。
+  确认旧顺序 Executor 不作为 Tools V1 的正式调用链路或 fallback 验收目标。
+Step 13：Tools V1 最终测试和文档收尾
+  更新 Tools层设计决策汇总.md、Tools层开发步骤与进度.md，跑相关测试。
+```
+
+你的回答：采取你的建议
+
+
+### 问题 66：Tools V1 的完成标准是否认可下面这组？
+
+建议完成标准结合前面已确认的边界，暂定为：
+```text
+1. 所有正式工具统一返回 ToolResult，不返回裸字符串作为正式协议。
+6. ToolManager 保留旧 run_tool 兼容入口，但内部转换为正式请求。
+7. ReActExecutor 不直接执行 shell，命令统一通过 command_tool。
+8. Observation 由 ReActExecutor 根据真实 ToolResult 生成，模型不能伪造。
+9. Observation 支持 minimal / standard / full 规划等级；默认使用结构化裁剪和 preview，不默认调用模型摘要。
+10. 完整 raw_output 默认不进入 Observation；需要时通过 full、chunk 或 raw_ref / artifact_ref 受控取得。
+11. 用户可见 events 与 logs/tools.log 分离。
+12. logs/tools.log 使用 JSONL，记录 trace、工具、耗时、错误码、摘要和脱敏信息。
+13. 文件工具限制在 workspace_root 内，敏感路径和大文件按策略限制。
+14. 文件写入能明确区分 create / overwrite / append / patch；patch 支持局部替换、插入和删除。
+15. 未开启适用的总授权时，覆盖和局部修改等副作用操作必须请求确认；即使有总授权，敏感文件和越界操作仍需确认或阻断。
+16. delete_file 只处理 workspace 内的明确文件或文件列表；目录删除和递归删除必须拦截。
+17. 普通 command_tool 使用 argv / shell=False；复杂 shell 语法进入单独的 shell_command_tool 或 shell mode，并经过 high risk、dry_run 和确认流程。
+18. 危险命令、越界破坏性操作和明显泄露密钥的命令必须直接阻断，不能只靠确认放行。
+19. 文件管理工具具备 read/list/find/info/write/copy/move/rename/delete 基础能力。
+20. DocumentParser 支持 txt/md/json/csv/pdf/docx/xlsx，并返回结构化解析结果。
+21. web_search 使用统一工具名和 WebSearchData，search_tool 保留为 legacy alias。
+22. web_search provider 可插拔，支持 search_api 和 model_builtin，并可由配置决定 auto 下的优先顺序。
+23. model_builtin_search 必须通过 Models 层调用；具体 GPT、Kimi、DeepSeek 或其他模型的联网参数由 Models provider adapter 处理。
+24. search_api 和 model_builtin 结果都归一化为同一种 WebSearchData；没有 URL/证据的模型联网总结不得伪装为可审计搜索结果。
+25. 搜索工具负责返回搜索证据；复杂总结、长文总结和最终自然语言回答由 ReActExecutor 在需要时单独调用 Models 层完成。
+26. MCP V1 支持用户配置 Server、发现 tools/list、动态注册 ToolSpec 和统一 tools/call 执行；模型正常调用 mcp.<server_id>.<tool_name>，而不是模糊的 mcp_execute。
+27. MCP 工具与内置工具一样接受本地 schema、白名单、风险、确认、timeout、日志和 ToolResult 归一化控制。
+28. timeout、retry、错误码、权限拒绝和确认等待都结构化返回。
+29. 单元测试覆盖协议、调度、命令、文件、文档解析、联网搜索、MCP、安全边界、日志和 ReActExecutor 集成。
+30. 真实联网、真实模型 provider 和真实 MCP Server 集成测试默认 skip，只有显式环境变量、配置和凭证齐全时才运行。
+```
+
+你的回答：采取你的建议
+
+
+### 问题 67：Tools V1 是否暂不做以下能力？
+
+结合前面已经确认“Tools V1 需要支持受控 MCP 接入”的结论，建议 V1 暂不做或明确后置以下能力：
+```text
+1. 不做完整 MCP 插件市场、自动搜索/下载/安装未知 MCP Server。
+2. 不做 MCP Resources、Prompts、Sampling、多级嵌套调用和复杂跨进程恢复；V1 先做 Server 配置、tools/list 和 tools/call。
+3. 不做任意远程工具的无确认自动执行；远程 MCP 工具仍由本地安全策略约束。
+4. 不允许外部模型 provider 直接执行本地工具、读取本地文件或绕过 ToolRegistry。
+5. 不做完整网页正文抓取、浏览器自动化和网页交互；fetch_url / read_web_page / browser 工具后续再做。
+6. 不做递归目录删除、批量 glob 删除或目录删除。
+7. 不做跨工作区任意文件访问；工作区外文件、系统敏感路径和凭证文件按策略阻断。
+8. 不做完整权限 UI；V1 先把总授权、逐次确认、dry_run、确认恢复所需的协议和数据准备好。
+9. 不做复杂沙箱虚拟机；先落实 workspace、文件、命令、网络和输出限制等实际边界。
+10. 不做长期搜索缓存、网页索引服务或搜索知识库；只预留必要 cache / source 字段。
+11. 不做完整 RAG 文档入库；DocumentParser 只负责受控解析和结构化输出。
+12. 不把 Analyzer、Planner、ReActExecutor 的理解、规划、Checker 或 Observation 决策逻辑迁移到 Tools 层。
+13. 不重做 Models 层 provider、路由、retry 和结构化调用体系；Tools 只通过 Models 层消费 model_builtin_search 等能力。
+14. 不把每次 ToolResult 的 Observation 摘要都交给模型生成；需要模型总结时必须是显式模型步骤。
+```
+为什么要问：
+这些能力重要，但如果都塞进 V1，会拖慢当前“让 Agent 主链路可稳定使用工具”的核心目标。
+
+你的回答：采取你的建议
+
+
+---
+
+## 17. 真实使用偏好
+
+### 问题 68：你希望 Tools V1 最优先打磨哪几类真实任务？
+
+示例：
+
+```text
+代码项目开发：读文件、改文件、跑测试
+资料搜索：联网搜索、证据整理
+文档处理：解析 pdf/docx/xlsx/csv/json
+系统命令：受控执行命令
+普通辅助：计算、时间、文本处理、翻译
+```
+
+建议优先级：
+
+```text
+1. 代码项目开发：文件工具 + command_tool
+2. 资料搜索：web_search provider adapter
+3. 文档处理：DocumentParser V1
+4. 普通辅助工具：math/time/text/translator
+5. 高风险 code_executor 后置
+```
+
+为什么要问：
+这会影响开发步骤里哪些工具先做完整，哪些先兼容保留。
+
+你的回答：1、通用的工具层处理逻辑 2、阅读、编辑、终端、联网搜索、预览、mcp执行工具这些都需要实现，然后再就是你建议的也需要实现
+
+
+### 问题 69：你希望联网搜索第一阶段优先接哪一种 provider？
+
+选项：
+
+```text
+A. search_api provider，例如 Bing / Tavily / SerpAPI
+B. model_builtin provider，例如 GPT / Kimi / DeepSeek 等支持联网搜索的模型
+C. 两个都先做接口，第一阶段用 fake provider 测试，真实 provider 后置
+D. auto 模式完整做，但真实联调等 key 和参数确定后再开
+```
+
+建议：
+选 D 或 C。接口和数据结构先定死，真实 provider 不阻塞 Tool 层协议正式化。
+
+如果短期你有支持联网的 GPT/OpenAI-compatible 服务，可以先实现 `model_builtin` 作为可用路径，但要保留 `search_api` adapter，不把联网搜索绑定到某个模型。
+
+你的回答：C吧，search_api provider，model_builtin provider都给我完整实现，只不过在验收测试的时候先使用假的数据测试一下即可，预留真实的api和模型，就是说我后续测试时只要配置了search_api的搜索第三方接口比如Tavily以及配置了模型apikey马上既可以测试这个正式的联网搜索功能
+
+
+### 问题 70：你有没有特别不希望 Tools 层自动做的事情？
+
+例子：
+
+```text
+不要自动删除文件
+不要自动覆盖已有文件
+不要自动运行高风险命令
+不要把完整文件内容写日志
+不要把敏感文件发给外部模型
+不要让模型直接调用本地工具
+不要在无确认情况下联网
+```
+
+你的回答：反正风险等级高的都需要获取用户确认在做即可
+
+
+### 问题 71：你希望面试或介绍项目时怎么讲 Tools 层？
+
+选项：
+
+```text
+A. Agent 外部能力执行层
+B. 工具注册与权限控制层
+C. 带审计日志的结构化工具运行时
+D. ReActExecutor 的安全工具调用网关
+E. 支撑文件、命令、搜索和文档解析的工具服务层
+```
+
+建议：
+可以组合讲：
+
+```text
+Tools 层是 ReActExecutor 的安全工具调用网关，负责把模型生成的结构化 ActionPacket 转换为真实、受控、可审计的工具执行结果，并通过统一 ToolResult 返回给执行器生成 Observation。
+```
+
+你的回答：采取你的建议
+
+
+### 问题 72：你对 Tools 层还有哪些额外要求？
+
+可以补充：
+
+```text
+希望优先支持的工具
+命令执行偏好
+文件权限边界
+联网搜索 provider
+日志保留策略
+隐私边界
+特殊工具参数
+后续 UI/API 需求
+```
+
+你的回答：编辑，阅读、预览、终端这几个功能最重要，一定要给我实现，其他的当然也要是实现，只不过以上几个工具是使用率最高的所以必须实现，然后就是和其他层的联动比如和Observation的交互，这块需要好好设计细节，尽量控制成本，能不调用模型就不调用（太耗费token了），但是如果必须要模型来进行灵活决策的设计和开发时及时说
+
+
+### 问题 73：本轮回答后，如果仍有不明确点，是否允许继续生成第二轮问题文档？
+
+建议：
+允许。Tools 层涉及文件、命令、搜索、模型联动、权限、安全和日志，第一轮回答后很可能还需要围绕 web_search provider 配置、CommandTool 安全矩阵、文件工具确认策略等细节追问。
+
+你的回答：允许

@@ -1,0 +1,1560 @@
+# Memory / Context MVP 设计问题回答（1）
+
+本文档用于第一轮确认 Memory / Context MVP 层的设计问题。请直接在每个“你的回答：”后面填写答案。
+
+说明：
+- 这些问题不是考试题，目的是把 Memory / Context MVP 层的职责边界、SessionManager、SessionState、Message、ShortTermMemory、ContextBuilder、会话保存恢复、多轮上下文和最小验收标准定清楚。
+- 当前 `src/memory` 下已有的 `short_term_memory.py`、`long_term_memory.py` 只是早期占位实现，可以完全抛弃，不要求沿用原来的结构和思路。
+- 本轮设计目标不是做完整长期记忆、RAG、复杂向量库或生产级记忆系统，而是先让 Agent 可以基于 session_id 进行多轮对话、保存会话、恢复会话，并为 Runtime / CLI / API 提供稳定上下文接口。
+- 如果你不确定，可以写“按你的建议来”，后续会按任务型 Agent 的常见工程做法给出保守、可落地的方案。
+- 有些问题后面写了“为什么要问”，方便你理解这个问题会影响哪部分设计。
+- 如果本轮回答后仍有不明确的点，后续可以继续生成 `Memory设计问题回答(2).txt`、`Memory设计问题回答(3).txt` 等。
+
+当前项目核心链路：
+用户输入
+  -> Runtime / CLI / API
+  -> SessionManager / Memory
+  -> ReactAgent
+      -> Analyzer
+      -> Planner
+          生成 TaskPlan / TaskUnit / PlanStep
+      -> ReActExecutor
+          Reasoning -> Decision -> Tool -> Observation -> Checker
+      -> Response
+  -> OutputFeedback
+  -> Memory 更新
+  -> 用户反馈
+
+
+当前已完成或接近完成的基础层：
+
+```text
+Analyzer V1:
+  负责意图、参数、风险、复杂度、工具策略、澄清/确认判断。
+
+Planner V1:
+  负责生成 TaskPlan / TaskUnit / PlanStep。
+
+ReActExecutor V1:
+  负责 Planner-guided ReAct 主循环：
+  Reasoning -> Decision -> Tool/Model/User/Control -> Observation -> Checker。
+
+Models V1:
+  提供 ModelManager.generate / generate_json / stream_generate / health_check / compress_context。
+
+Tools V1:
+  提供 ToolResult / ToolSpec / ToolCallRequest / ToolRuntime / ToolManager / ToolRegistry。
+```
+
+Memory / Context MVP 要服务这些已完成层，不重新设计 Analyzer、Planner、ReActExecutor、Models 或 Tools。
+
+当前 Memory 层真实状态：（这部分的旧代码逻辑可以抛弃使用最新的Memory方案）
+
+```text
+src/memory/short_term_memory.py:
+  只有单对象内存列表，支持 add_message / get_history / get_history_text / clear。
+  没有 session_id。
+  没有会话隔离。
+  没有保存恢复。
+  没有 summary。
+  没有 ContextBuilder。
+
+src/memory/long_term_memory.py:
+  更像早期文档持久化占位，用 pickle 保存 documents。
+  不是对话 Session Memory。
+  不适合作为当前 Memory / Context MVP 的主设计基础。
+
+src/memory/__init__.py:
+  只是包入口。
+```
+
+当前重要工程注意事项：
+
+```text
+src/agent 目录已经按层整理，但部分 import 路径还没有迁移。
+Memory 开发可以先按新结构设计，但要跑整体测试前，需要处理 agent 层 import 兼容或路径迁移问题。
+```
+
+Memory / Context MVP 的核心目标：
+
+```text
+1. 支持 session_id。
+2. 同一个 session 能连续多轮对话。
+3. 不同 session 的历史互不混淆。
+4. 程序重启后能恢复最小会话状态。
+5. 为 ReactAgent / Runtime 提供统一上下文文本或结构化上下文。
+6. 先按消息数量控制上下文长度，不做复杂 token 压缩。
+```
+
+Memory / Context MVP 与其他已完成层的对接关系：
+
+```text
+Runtime / CLI / API:
+  直接对接。
+  Runtime 接收 session_id，调用 SessionManager 创建/加载 session。
+  Runtime 将绑定当前 session 的 Memory 注入 ReactAgent。
+  一轮执行结束后由 Runtime 或 Memory 触发保存。
+
+ReactAgent:
+  直接对接。
+  当前 ReactAgent 已经依赖 short_term_memory.add_message() 和 get_history_text()。
+  Memory MVP 需要兼容当前调用方式，后续再逐步接入 ContextBuilder。
+
+Analyzer:
+  间接对接。
+  Analyzer 当前主要消费 user_input，不直接依赖 Memory。
+  后续多轮追问、指代消解、继续上文等能力可以通过 context/history 间接辅助 Analyzer。
+
+Planner:
+  间接对接。
+  Planner 当前主要消费 Analyzer 输出。
+  后续可以从 Memory 提供的 context 中获得前文目标、文件路径、用户约束和项目背景。
+  MVP 阶段先不强制改 Planner 接口，可预留 planning_context 扩展方向。
+
+ReActExecutor:
+  下游消费，不由 Memory 直接调用。
+  当前 ReactAgent 会把 history 传入 executor.execute(..., history=history)。
+  Memory 生成的 context/history 通过 ReactAgent / Runtime 传入主链路，最终进入 ReActExecutor prompt 和执行上下文。
+  ReActExecutor 仍负责 ActionPacket、工具调用、Observation、Checker 和最终结果。
+
+Models:
+  直接对接。
+  后续 ConversationSummarizer / ContextBuilder 可以复用 ModelManager.compress_context()。
+  Memory 不重新实现模型调用，只负责选择要压缩的消息、保存 summary、拼接上下文和失败降级。
+
+Tools:
+  间接对接。
+  Memory 不直接调用工具。
+  ToolResult 由 ReActExecutor 转成 Observation 和最终回答。
+  对用户可见的工具调用过程、工具结果摘要、确认请求和错误信息需要作为会话展示记录持久化。
+  原始 ToolResult / ObservationStore 是否完整保存，取决于后续的调试与数据脱敏策略；
+  MVP 不把它们直接混入给模型的对话上下文。
+```
+
+最重要的对接原则：
+
+```text
+Runtime 负责选择和生命周期管理 session。
+Memory 负责保存会话和构建上下文。
+ReactAgent 负责把上下文送入 Analyzer / Planner / ReActExecutor 主链路。
+ReActExecutor 负责真正执行任务并产出结果。
+Models 负责后续上下文压缩和摘要生成能力。
+Tools 不被 Memory 直接调用。
+```
+
+补充确认：
+
+```text
+更稳的工程边界是：
+
+Runtime / CLI / API
+  -> SessionManager / Memory
+  -> ReactAgent
+      -> Analyzer
+      -> Planner
+      -> ReActExecutor
+          -> Models / Tools
+
+Memory 不是推理链上的独立决策层，而是会话状态和上下文供给层。
+Memory 主要服务 Runtime 和 ReactAgent；ReActExecutor 是上下文的下游消费者，但 Memory 不直接调用 ReActExecutor。
+注：Memory 不直接调用 ReActExecutor。
+Memory 通过 ContextBuilder 生成 context_text。
+ReactAgent / Runtime 将 context_text 作为 history 或 planning_context 传入主链路。
+ReActExecutor 每轮执行时读取 history，用于理解当前任务的前文、约束和最近对话。
+MVP 阶段每轮都传上下文；短对话传完整历史，中长对话传 summary + 最近消息窗口。
+
+Analyzer 和 Planner 最好不要直接依赖 Memory 类；如果它们需要前文信息，应由 ReactAgent / Runtime 把 context/history 作为输入传入。
+
+直接对接：
+  Runtime / CLI / API
+  ReactAgent
+  Models
+
+下游消费：
+  ReActExecutor
+
+间接对接：
+  Analyzer
+  Planner
+
+不直接对接：
+  Tools
+```
+
+---
+
+## 1. Memory / Context MVP 在整体 Agent 中的定位
+
+### 问题 1：你是否同意 Memory / Context MVP 层只负责“会话状态和上下文组织”，不承担 Analyzer / Planner / Executor 的职责？
+
+通俗解释：
+Memory 不应该重新理解用户意图，不应该生成计划，也不应该决定工具调用。它只负责保存会话、读取历史、组织上下文，把合适的上下文交给 Agent 主链路。
+
+建议：
+Memory / Context MVP 定位为：
+
+```text
+接收 session_id 和消息
+  -> 保存用户/助手消息
+  -> 管理会话状态
+  -> 生成当前轮上下文
+  -> 保存/恢复 SQLite 中的会话数据
+```
+
+Memory 不决定任务怎么拆、不调用工具、不生成最终回答。Analyzer、Planner、ReActExecutor 仍然是主决策链路。
+
+为什么要问：
+这决定 Memory 是基础状态服务，还是膨胀成第二个 Planner/Executor。MVP 阶段必须避免职责膨胀。
+
+你的回答：同意，采取你的建议
+
+
+### 问题 2：Memory / Context MVP 是否优先服务“当前单用户本地 Agent”，暂不做多用户权限和复杂账号系统？
+
+通俗解释：
+现在目标是让你的本地 Agent 先跑起来，可以用 session_id 区分不同对话。多用户登录、权限隔离、租户管理都属于更后面的工程化能力。
+
+建议：
+MVP 阶段只支持本地单用户、多 session：
+
+```text
+一个本地用户
+  -> 多个 session_id
+  -> 每个 session 独立保存 messages / summary / metadata
+```
+
+暂不实现用户账号、团队空间、数据库权限、多租户隔离。
+
+为什么要问：
+如果现在引入多用户模型，Memory 层会变复杂，影响“先跑通 Agent”的目标。
+
+你的回答：是的，优先服务当前单用户本地 Agent，服务一个单用户即可
+
+
+### 问题 3：是否把原来的 short_term_memory.py 和 long_term_memory.py 视为可删除/可替换的占位代码？
+
+通俗解释：
+原来的 `ShortTermMemory` 只是一个列表，`LongTermMemory` 只是 pickle 文档列表。它们可以提供一点参考，但不适合作为正式 Memory MVP 的架构基础。
+
+建议：
+同意完全替换旧实现。新 Memory 层按以下结构重新设计：
+
+```text
+src/memory/
+  message.py
+  session_state.py
+  short_term_memory.py
+  session_manager.py
+  context_builder.py
+  storage.py
+  summary.py
+```
+
+旧文件名可以保留但内部重写，也可以新增文件后逐步移除旧占位逻辑。
+
+为什么要问：
+这决定后续开发是否需要兼容旧接口。我的建议是只兼容 ReactAgent 当前需要的 `add_message()` 和 `get_history_text()` 这类调用习惯，不兼容旧实现细节。
+
+你的回答：可以，反正Memory层需要使用新的方案来进行开发。旧代码如果需要可以删除
+
+
+---
+
+## 2. Session 与数据结构
+
+### 问题 4：Session 是否作为 Memory MVP 的核心边界？
+
+通俗解释：
+一次连续对话应该有一个 `session_id`。用户继续这个 session 时，Agent 能看到前文；切到另一个 session 时，历史不混在一起。
+
+建议：
+Session 是 Memory MVP 的核心边界。最小关系：
+
+```text
+session_id
+  -> SessionState
+      -> messages
+      -> summary
+      -> metadata
+      -> created_at
+      -> updated_at
+```
+
+为什么要问：
+如果没有 session 边界，多轮对话只能存在于单个内存对象里，无法支持恢复和隔离。
+
+你的回答：采取你的建议，一个Session可以有多个对话（后续对话就有上下文，但都是属于这个session_id的对话，和其他Session没有关系），开启一个新Session时这个新Session就没有历史对话，然后可开启第一个对话，第一个对话结束后，开启第二段对话，那第一段对话就是这个新Session的历史对话了
+
+
+### 问题 5：session_id 应该由系统自动生成，还是允许用户/CLI/API 指定？
+
+通俗解释：
+用户通过 CLI 或 API 调用 Agent 时，可以不传 session_id，由系统生成；也可以传已有 session_id，继续历史对话。
+
+建议：
+两种都支持：
+
+```text
+未传 session_id:
+  SessionManager 自动生成 session_<短uuid>
+
+传入 session_id:
+  尝试加载已有 session
+  不存在时创建新 session
+```
+
+建议 session_id 使用安全字符：
+
+```text
+session_20260819_ab12cd34
+```
+
+同时必须做 session_id 归一化和路径安全校验：
+
+```text
+只允许字母、数字、下划线、短横线。
+禁止 ..、斜杠、反斜杠、绝对路径和空字符串。
+session_id 只作为目录名，不允许直接拼接用户输入路径。
+```
+
+为什么要问：
+这会影响 Runtime / CLI / API 的入口参数设计，以及 SQLite 中 session 的创建、加载和查询。
+
+你的回答：采取你的建议
+
+
+### 问题 6：Message 最小字段应该包含哪些？
+
+通俗解释：
+每一轮对话不只是文本，最好带上角色、时间、消息 id 和 metadata，方便后续调试、压缩、过滤和测试。
+
+建议：
+MVP 的用户/助手对话 Message 使用较完整但稳定的字段：
+
+```python
+Message(
+    message_id: str,
+    session_id: str,
+    run_id: str | None,     # 用户消息为空；Agent 生成的消息关联本轮 run
+    timeline_seq: int,      # 同一个 session 内的全局展示顺序
+    role: str,              # user / assistant / system / tool
+    content: str,
+    content_format: str,    # text / markdown / json
+    display_type: str,      # chat / final_answer / clarification / confirmation
+    visible_to_user: bool,
+    status: str,            # pending / streaming / completed / failed
+    parent_message_id: str | None,
+    created_at: str,
+    updated_at: str | None,
+    metadata: dict = {},
+)
+```
+
+`Message` 只表示真正的聊天消息。计划、工具调用进度、工具结果摘要、执行错误等不是聊天消息时，应保存为独立的 `ExecutionEvent`，而不是硬塞进 `messages`。
+
+重要边界：
+
+```text
+需要持久化：
+  用户实际发送的原文。
+  Agent 最终展示给用户的原文。
+  用户界面实际展示的澄清、确认、报错等消息。
+
+不应作为 Message 持久化：
+  原始模型 prompt。
+  模型隐藏推理 / Chain of Thought。
+  API Key、令牌、密码、Cookie 等敏感配置。
+  没有展示给用户且没有调试价值的大量内部临时对象。
+```
+
+为什么要问：
+Message 字段太少，后续保存恢复和上下文构建会不够用；字段太多，MVP 会变重。
+
+你的回答：采取你的建议，但是我建议，即使是MVP，字段还是多考虑一些情况，适当增加一些字段来进行记录，万一后续测试时缺了什么字段就不好了
+
+
+### 问题 7：SessionState 最小字段应该包含哪些？
+
+通俗解释：
+SessionState 是一个会话的完整状态。Runtime 只要拿到 session_id，就能通过它恢复上下文。
+
+建议：
+`SessionState` 是运行时加载出来的完整会话对象；SQLite 中不保存一个不断膨胀的 `SessionState` JSON 大字段，而是将其拆分保存后再恢复为对象：
+
+```python
+SessionState(
+    session_id: str,
+    messages: list[Message],
+    summary: str = "",
+    current_summary_id: str | None,
+    created_at: str,
+    updated_at: str,
+    last_activity_at: str,
+    status: str,            # active / archived / deleted
+    metadata: dict = {},
+)
+```
+
+metadata 可以先放：
+
+```text
+title
+message_count（可冗余缓存，也可查询计算）
+last_user_message_id
+last_assistant_message_id
+last_run_id
+current_summary_id
+agent_version
+model_profile
+tags
+```
+
+其中 `messages`、`summary`、最近 run、展示事件等由 SQLite 查询并组装；不是把它们重复序列化到 `sessions` 表。这样可避免一份会话数据在多个位置不一致。
+
+暂不支持把一个被中断的 ReAct 循环从中间继续执行；但需要保存它已经展示给用户的过程，并在重启后把未结束 run 标记为 `interrupted`，让用户看见真实状态。
+
+为什么要问：
+这决定会话保存文件的 schema，也决定后续 Runtime 如何恢复一个会话。
+
+你的回答：采取你的建议，我建议metadata 再多加一些字段记录消息状态和其他信息，万一后续要使用到呢，所以我建议这个SessionState 尽量多储存一些信息
+SessionState 就是为了让旧 session 重新打开后，能把前面的对话和状态带回来，继续后面的聊天。
+
+
+---
+
+## 3. ShortTermMemory 与多轮上下文
+
+### 问题 8：ShortTermMemory 应该是“单个 session 的消息容器”，还是“管理所有 session 的大对象”？
+
+通俗解释：
+一种做法是每个 session 有自己的 ShortTermMemory；另一种是 ShortTermMemory 里面维护很多 session。MVP 阶段建议让 SessionManager 管所有 session，ShortTermMemory 只服务一个 session。
+
+建议：
+采用：
+
+```text
+SessionManager:
+  管理多个 SessionState
+
+ShortTermMemory:
+  包装单个 SessionState 的 messages 操作
+```
+
+这样职责更清楚：
+
+```text
+SessionManager 负责找哪个 session
+ShortTermMemory 负责这个 session 里怎么加消息、取最近消息
+ContextBuilder 负责怎么拼上下文
+```
+
+为什么要问：
+这决定类之间的边界。如果 ShortTermMemory 同时管理所有 session，后续容易和 SessionManager 职责重叠。
+
+你的回答：采取你的建议，ShortTermMemory 的功能不要和SessionManager 重叠了
+
+
+### 问题 9：最近消息窗口先按“消息条数”还是“token 数”控制？
+
+通俗解释：
+token 计算更准确，但实现成本更高。现在只是要跑通 Agent，多数情况先按最近 N 条消息即可。
+
+建议：
+MVP 阶段先按消息条数：
+
+```text
+max_recent_messages = 20
+```
+
+保留配置字段，后续 Context 管理增强层再接 token 统计：
+
+```text
+max_context_tokens
+max_context_chars
+```
+
+为什么要问：
+这决定 MVP 是否会被复杂 token 预算拖慢。当前目标是先多轮可用，不追求长上下文最优。
+
+你的回答：可以先按照对话条数吧，20个太多了，先采取10个吧，反正窗口在10个对话以内基本也可以知道前面对话讲了什么，还有每一条对话的持久化储存目前采取的是什么
+
+
+### 问题 10：同一个 session 的“多轮上下文”是否只需要最近消息 + summary，而不需要把全部历史永远传给模型？
+
+通俗解释：
+对话少的时候可以传完整历史；对话变多后，应该传 summary 和最近消息。MVP 可以先不自动压缩，但结构要预留。
+
+建议：
+ContextBuilder 输出逻辑：
+
+```text
+如果消息数量 <= max_recent_messages:
+  context = all_messages
+
+如果消息数量 > max_recent_messages:
+  context = summary + recent_messages
+```
+
+MVP 阶段 summary 可以为空，或由后续手动/简单更新。自动摘要放到增强层。
+
+为什么要问：
+这决定后续对话能不能既看到前文，又避免上下文无限增长。
+
+你的回答：采取你的建议，消息没超过阈值就按照窗口都传（比如对话数量小于10那就都传，大于10了就传当前窗口对话全部+前面对话的summary ）
+
+
+---
+
+## 4. ContextBuilder 输出协议
+ContextBuilder 是“整理上下文的人”，输出协议就是“规定整理后的上下文长什么样”。
+### 问题 11：ContextBuilder 应该输出纯字符串，还是结构化 Context 对象？
+
+通俗解释：
+当前 ReactAgent / Executor 很多地方用的是 `history: str`，但后续 Runtime / API 可能需要结构化信息，比如用了哪些消息、summary 是否生效。
+
+建议：
+内部使用结构化对象，对外提供字符串兼容方法：
+
+```python
+ContextBuildResult(
+    session_id: str,
+    context_text: str,
+    summary: str,
+    recent_messages: list[Message],
+    included_message_ids: list[str],
+    truncated: bool,
+    current_user_input_included: bool,
+    metadata: dict,
+)
+```
+
+同时提供：
+
+```python
+context_builder.build(...).context_text
+short_term_memory.get_history_text()
+```
+
+这样既能兼容当前链路，又为后续 API / 调试 / 测试留出结构。
+
+为什么要问：
+如果只返回字符串，短期简单，但后续很难测试“到底用了哪些历史”。如果只返回结构化对象，当前 Agent 适配会更麻烦。
+
+你的回答：采取你的建议，根据对接调用方的要求灵活调整
+
+
+### 问题 12：ContextBuilder 拼接上下文时，格式是否固定为可读文本？
+
+通俗解释：
+模型最容易消费的是清晰、稳定、有边界的文本格式，而不是随便拼接几行。
+
+建议：
+MVP 使用固定文本格式：
+
+```text
+[Session Summary]
+{summary 或 "No summary yet."}
+
+[Recent Messages]
+user: ...
+assistant: ...
+
+[Current User Input]
+...
+```
+
+注意：当前用户输入可以不重复写入 recent_messages，避免同一轮输入出现两次。实现时要明确是“先 build context 再 add user message”，还是“先 add user message 再 build context”。
+
+我的建议：
+
+```text
+Runtime:
+  本轮输入到达后，先取得或创建 session。
+  再把 user message 写入 session。
+  然后 build context。
+  最后调用 ReactAgent / ReActExecutor。
+
+ContextBuilder:
+  如果 current_user_input 已经是最后一条 user message，可以不重复追加
+```
+
+MVP 阶段每一轮都构建并传入 context，不只在长对话时传。区别只在内容多少：
+
+```text
+短对话：
+  完整 messages。
+
+中等对话：
+  summary + 最近 N 条 messages。
+
+长对话：
+  压缩后的 summary + 最近 N 条 messages。
+```
+
+为什么要问：
+上下文格式影响模型稳定性，也影响测试断言。
+
+你的回答：采取你的建议
+
+
+### 问题 13：Memory 应该如何接入当前 ReactAgent？
+
+通俗解释：
+当前 ReactAgent 已经会调用：
+
+```python
+short_term_memory.add_message("user", user_input)
+history = short_term_memory.get_history_text()
+short_term_memory.add_message("assistant", response)
+```
+
+后续 Memory MVP 可以先兼容这个接口，再逐步让 Runtime 接管 session。
+
+建议：
+分两步：
+
+```text
+第一步：
+  新 ShortTermMemory 保持 add_message / get_history_text / get_history / clear 等兼容接口。
+
+第二步：
+  Runtime 创建或加载 session，并把绑定当前 session 的 ShortTermMemory 注入 ReactAgent。
+```
+
+更准确的接入边界：
+
+```text
+Memory 不直接调用 ReActExecutor。
+ShortTermMemory / ContextBuilder 提供 history/context_text。
+ReactAgent 负责把 history/context_text 传给 executor.execute(..., history=...)。
+后续如果 Analyzer / Planner 需要前文信息，也通过 ReactAgent / Runtime 传入 context，而不是直接读取 Memory。
+```
+
+这样不用一开始大改 ReactAgent，就能让多轮 session 先跑通。
+
+为什么要问：
+这决定 Memory MVP 是小步接入，还是一开始重构 ReactAgent。为了先跑通，我建议小步接入。
+
+你的回答：采取你的建议，先小步接入。既然ReactAgent调用的是旧接口，那就先保留旧接口，这是接口后面的处理逻辑是新的逻辑，然后可以添加新的接口对应新的功能，如果需要ReactAgent需要对接这个功能就调用新接口即可（反正ReactAgent不可能就仅仅只是调用那几个旧接口而已，肯定还需要接入Memory层的新功能）
+
+
+---
+
+## 5. 会话保存与恢复
+
+### 问题 14：会话状态 MVP 是否确定使用 SQLite，而不是本地 JSON 文件保存？
+
+通俗解释：
+你希望 Agent 重启后仍能恢复完整会话，并且后续会继续使用正式数据库。Session、消息、执行记录都天然需要按 `session_id` 查询、排序和增量写入，SQLite 比一个不断变大的 JSON 文件更可靠，也更便于测试。
+
+建议：
+确定使用 Python 标准库 `sqlite3`，数据库文件为：
+
+```text
+storage/agent_memory.db
+```
+
+SQLite 负责保存所有需要恢复的结构化会话数据；`SessionState` 在加载时由 `sessions`、`messages`、`agent_runs`、`execution_events`、`session_summaries` 组装出来。
+
+```text
+不使用 pickle。
+不把整个会话存成一个 JSON 文件。
+metadata / 可扩展字段可以保存在 SQLite 的 metadata_json / payload_json TEXT 字段。
+```
+
+为什么要问：
+这决定 Storage 边界、会话恢复方式和后续数据库迁移路径。SQLite 是当前单用户本地 Agent 的正式、轻量且足够稳定的选择。
+
+你的回答：确定使用 SQLite。需要保证 Agent 重启后可以读取历史消息、SessionState 和一个 Session 的完整用户可见对话过程。
+
+
+### 问题 14.1：重启后“恢复得和第一次看到的一样”具体恢复什么？
+
+通俗解释：
+恢复不仅是让模型拿到最近 10 条上下文，也包括让 CLI / API / 后续前端能重新展示这个 session 的历史。两者使用的数据相同，但查询范围不同。
+
+建议：
+
+```text
+必须恢复：
+1. Session 基本信息：session_id、标题、创建/更新时间、状态、metadata。
+2. 用户原始输入消息。
+3. Agent 最终回答、澄清问题、确认请求、错误提示等用户可见消息原文。
+4. 用户界面实际展示过的计划、执行进度、工具调用和工具结果摘要。
+5. 每条展示记录的顺序、时间、状态和所属执行轮次。
+6. 当前 summary 及其覆盖的历史范围，供后续多轮上下文使用。
+7. 已结束、失败或被中断的执行轮次状态。
+
+不等于恢复：
+  从进程中断点继续运行中的 Python 调用栈或 ReAct 循环。
+  MVP 重启后只恢复历史与状态；之前未结束的 run 标记为 interrupted，用户可重新发起或继续任务。
+```
+
+为什么要问：
+这把“聊天上下文恢复”和“用户可见会话回放”定义为同一个持久化目标，避免只存最近窗口导致历史页面丢失。
+
+你的回答：需要。一个旧 session 重新打开时，用户应能看到与第一次对话时一致的历史消息和已展示执行过程。采取你的建议
+
+
+### 问题 14.2：模型执行过程中的哪些内容应保存，哪些绝不保存？
+
+通俗解释：
+“执行过程”不能等同于把所有内部对象、模型请求和思考内容直接写进数据库。需要保存的是用户曾看见、能够解释任务进展的展示事件；隐藏推理和敏感数据必须隔离。
+
+建议：
+
+```text
+保存为用户可见 ExecutionEvent：
+  已生成的计划摘要（如果界面展示）。
+  “正在调用某工具 / 工具调用完成 / 等待确认”等状态。
+  工具名称、经过脱敏后的参数摘要、展示给用户的结果摘要。
+  可展示的错误、重试提示和取消状态。
+
+不保存或默认脱敏：
+  原始模型隐藏推理 / Chain of Thought。
+  完整 system prompt、模型供应商鉴权头、API Key、密码、Cookie。
+  工具返回中未展示且可能包含敏感信息的原始全文。
+  纯内部临时对象、Python 异常堆栈中的敏感上下文。
+```
+
+如果后续要做开发者调试记录，应另设受控的 debug/audit 存储与脱敏策略，不能和普通用户会话展示混用。
+
+为什么要问：
+这样既满足“用户回头能看到当时看到的过程”，又避免把不应展示或不应长期保留的数据变成会话历史。
+
+你的回答：采用上述边界。用户实际看到的聊天消息、执行过程、工具调用结果摘要、确认、错误和最终回答都要保存；模型隐藏推理、密钥和未展示的敏感原始数据不保存到普通会话记录中。
+
+
+### 问题 14.2.1：结合 ReActExecutor 现有事件流，哪些 ExecutionEvent 进入用户可见历史，哪些只进内部日志？
+
+通俗解释：
+ReActExecutor 已经有一套事件流，核心对象是 `ExecutionEvent`，并且事件里已经有 `visible_to_user: bool` 字段。Memory 层不应该重新猜“用户能不能看到”，而应该优先尊重执行层给出的可见性。
+
+当前执行层已经提供的关键能力：
+
+```text
+EventStream.visible_events()
+  返回 visible_to_user=True 的事件。
+
+EventStream.internal_events()
+  返回 visible_to_user=False 的事件。
+
+EventStream.to_user_timeline()
+  把可见事件转换成用户时间线。
+
+EventStream.to_model_context()
+  把最近事件整理成模型可消费摘要。
+
+sanitize_event_payload()
+  对可见事件 payload 做敏感字段清理和截断。
+```
+
+建议：
+
+```text
+Memory 持久化用户可见历史时：
+  优先保存 event.visible_to_user=True 的事件。
+  保存前再次使用脱敏后的 message / payload。
+  写入 execution_events 表，用 timeline_seq 保持展示顺序。
+
+Memory 写内部日志时：
+  可以记录 event.visible_to_user=False 的事件类型、id、状态、长度、错误码。
+  不把完整 payload 写入普通用户会话历史。
+  不把隐藏推理、原始 prompt、原始工具结果、traceback、API Key 等写入用户可见历史。
+```
+
+按当前 ReActExecutor 的 `EVENT_TYPES`，MVP 建议这样分类：
+
+```text
+默认进入用户可见时间线：
+  progress_message
+  thought_visible
+  tool_started
+  tool_finished
+  tool_failed
+  command_started
+  command_finished
+  file_edited
+  step_started
+  step_completed
+  step_failed
+  confirmation_requested
+  retry_scheduled
+  retry_finished
+  retry_exhausted
+  fallback_started
+  fallback_finished
+  request_replan
+  system_notice
+  final_answer
+
+谨慎进入用户可见时间线：
+  message_delta
+    如果它是用户界面实际展示的流式回复片段，可以合并后保存；
+    如果只是中间模型输出，默认只进内部日志。
+
+  model_step_started / model_step_finished
+    如果界面展示“正在调用模型 / 模型步骤完成”，可以保存展示化摘要；
+    如果只是内部模型调用细节，默认只进内部日志。
+
+  observation_created
+    只有 observation.visible_to_user=True 且内容已脱敏时保存；
+    原始 Observation / raw_observation 不保存到用户可见历史。
+
+  action_selected
+    如果 packet.user_visible_message 是给用户看的计划说明，可以保存；
+    如果只是内部 ActionPacket 决策，默认只进内部日志。
+
+只进内部日志或审计，不进普通用户可见历史：
+  visible_to_user=False 的所有事件。
+  原始 ActionPacket。
+  原始 model prompt / raw_model_output。
+  原始 ToolResult / raw_tool_result。
+  raw_observation。
+  checker_result 的完整内部结构。
+  traceback / stack_trace / exception 详细上下文。
+```
+
+特殊说明：
+当前执行层里已经存在显式 `visible_to_user=False` 的事件，例如某些中间 `final_answer`、`request_replan`、跳过步骤记录。这类事件虽然名字像用户可见事件，但 Memory 仍然不能保存到用户可见时间线；应该等待执行层最终发出的可见 `final_answer` 或可见状态事件。
+
+为什么要问：
+这决定用户重新打开旧 session 时看到的是“真实展示过的过程”，而不是一堆内部调试事件或模型中间输出。
+
+你的回答：采用该方案。Memory 层以 ReActExecutor 事件的 `visible_to_user` 为第一判断标准；用户可见事件进入 `execution_events`，内部事件只进日志或后续审计，不进入普通会话回放。
+
+
+### 问题 14.3：SQLite 中需要哪些表，分别保存什么？
+
+通俗解释：
+`SessionState` 是一个 Python 对象，不应该靠一个大 JSON blob 永久保存。SQLite 按数据职责分表，加载时再组装为 `SessionState`，会更可靠且能精确查询。
+
+建议的 MVP 表：
+
+```text
+sessions
+  一个 session 一行。
+  保存：session_id、title、status、created_at、updated_at、last_activity_at、
+        current_summary_id、last_run_id、metadata_json、schema_version。
+
+messages
+  保存用户消息和助手消息的原始展示内容。
+  保存：message_id、session_id、run_id、timeline_seq、role、content、
+        content_format、display_type、visible_to_user、status、
+        parent_message_id、created_at、updated_at、metadata_json。
+
+agent_runs
+  一次用户输入触发的一整轮 Agent 执行一行。
+  保存：run_id、session_id、user_message_id、status、started_at、
+        finished_at、final_message_id、error_code、error_message、
+        agent_version、model_profile、metadata_json。
+
+execution_events
+  保存非聊天消息的用户可见执行过程。
+  保存：event_id、session_id、run_id、timeline_seq、event_type、
+        display_content、visible_to_user、status、created_at、
+        completed_at、parent_event_id、sanitized_payload_json、metadata_json。
+
+session_summaries
+  保存会话摘要及其版本，供上下文压缩和恢复使用。
+  保存：summary_id、session_id、content、covered_from_timeline_seq、
+        covered_to_timeline_seq、created_at、source、model_profile、metadata_json。
+
+schema_migrations
+  保存数据库 schema 版本，保证后续升级不会破坏已有 session。
+```
+
+`messages` 与 `execution_events` 都有同一个 session 的 `timeline_seq`。重新打开 session 时，按该字段合并排序，就能按原顺序回放用户当时实际看到的内容。
+
+为什么要问：
+这决定“完整可恢复会话”的数据模型，也避免把用户消息、最终回答、执行过程和摘要混成一个难维护的大表。
+
+你的回答：采用上述表结构。SessionState 通过这些 SQLite 表恢复，不把所有内容重复塞进一个 SessionState JSON 字段。
+
+
+### 问题 14.3.1：timeline_seq / run_id / display_type / status 的具体枚举范围建议是什么？
+
+通俗解释：
+这些字段不是给模型看的，而是给数据库、Runtime、CLI/API 和后续前端用的。它们的作用是让一条会话历史能被稳定排序、恢复、过滤和展示。
+
+建议：
+
+```text
+timeline_seq:
+  类型：int
+  范围：同一个 session 内从 1 开始递增。
+  作用：表示用户实际看到的展示顺序。
+  分配方：SQLiteSessionRepository 在写入事务里分配。
+  规则：messages 和 execution_events 共享同一个 timeline_seq 序列。
+  注意：不要只靠 created_at 排序，因为同一秒内可能有多条事件。
+
+run_id:
+  类型：str
+  格式建议：run_YYYYMMDD_HHMMSS_xxxxxx
+  作用：一次用户输入触发的一整轮 Agent 执行。
+  关系：
+    一个 user message -> 一个 agent_run。
+    一个 agent_run -> 多个 execution_events。
+    一个 agent_run -> 零个或一个最终 assistant message。
+  用户消息的 run_id 可以为空，也可以在 create_run 后回填；
+  MVP 建议用户消息写入后立即 create_run，并把 user_message_id 关联到 agent_runs。
+
+message_id:
+  格式建议：msg_YYYYMMDD_HHMMSS_xxxxxx
+
+event_id:
+  格式建议：event_YYYYMMDD_HHMMSS_xxxxxx
+
+summary_id:
+  格式建议：summary_YYYYMMDD_HHMMSS_xxxxxx
+```
+
+`display_type` 建议先收敛为：
+
+```text
+chat
+  普通用户/助手聊天消息。
+
+final_answer
+  Agent 本轮最终回答。
+
+clarification
+  Agent 向用户追问缺失信息。
+
+confirmation
+  Agent 请求用户确认、授权或选择。
+
+tool_progress
+  工具开始、工具结束、命令开始、命令结束、文件编辑等可见执行过程。
+
+plan_progress
+  step_started、step_completed、thought_visible 等可见计划/步骤进展。
+
+system_notice
+  阻塞、失败、配置缺失、安全拦截等系统提示。
+
+error
+  用户可见错误。
+
+summary
+  摘要记录一般不作为聊天消息展示；如后续前端展示摘要，可使用该类型。
+```
+
+`agent_run.status` 建议使用：
+
+```text
+pending
+running
+waiting_user
+completed
+failed
+partial_failed
+blocked
+cancelled
+request_replan
+interrupted
+```
+
+说明：
+前 9 个状态来自当前 ReActExecutor 的执行状态体系；`interrupted` 是 Memory 恢复时新增的持久化状态，用于表示程序重启前 run 还处于 running / pending / waiting_user 但进程已经不存在。它不是执行器内部循环状态，而是持久化恢复状态。
+
+`message.status` 建议使用：
+
+```text
+pending
+streaming
+completed
+failed
+cancelled
+```
+
+`execution_event.status` 建议使用：
+
+```text
+recorded
+started
+completed
+failed
+waiting_user
+blocked
+skipped
+request_replan
+```
+
+说明：
+`execution_event.status` 可以由执行层事件类型推导：
+
+```text
+xxx_started -> started
+xxx_finished / xxx_completed / final_answer -> completed
+xxx_failed -> failed
+confirmation_requested -> waiting_user
+request_replan -> request_replan
+其他 -> recorded
+```
+
+为什么要问：
+如果这些字段没有固定枚举，后续 CLI/API/前端会很难稳定过滤和展示历史记录。
+
+你的回答：采用上述建议。MVP 先按这些枚举实现，后续如果 Runtime/API/前端有新展示形态，再通过 metadata_json 扩展，不随便扩大主枚举。
+
+
+### 问题 14.4：哪些数据进入模型上下文，哪些数据只用于会话回放？
+
+通俗解释：
+完整历史要长期保存在 SQLite，但不能每次都全部塞给模型。否则对话一长就超出上下文窗口，且工具执行详情会干扰模型。
+
+建议：
+
+```text
+长期保存：
+  messages、用户可见 execution_events、runs、summary 均保存到 SQLite。
+
+每轮提供给模型：
+  当前 summary。
+  最近 10 条 user / assistant 对话消息。
+  当前用户输入。
+  仅在确有任务连续性价值时，选择少量执行结果摘要或关键事件。
+
+默认不送给模型：
+  完整 execution_events 时间线。
+  大段工具原始输出。
+  历史错误堆栈、调试 payload。
+  与当前任务无关的旧计划和进度消息。
+```
+
+为什么要问：
+“可恢复的完整会话”与“可控的模型上下文窗口”必须同时成立，不能因为窗口只保留 10 条就删除数据库中的旧历史。
+
+你的回答：采取你的建议，完整历史和用户可见执行时间线全部保存在 SQLite；每轮传给模型的内容再由 ContextBuilder 按 summary、最近 10 条对话消息和当前输入组织。
+
+
+### 问题 14.5：消息和展示事件应该在什么时候写入 SQLite，如何保证顺序？
+
+通俗解释：
+若只在一整轮 Agent 结束后保存，进程中途崩溃会丢失用户输入和已展示的进度；若乱序写入，重新打开时的显示顺序会不正确。
+
+建议：
+
+```text
+1. 收到用户输入：
+   在一个事务中创建 / 更新 session、写入 user Message、创建 agent_run、
+   分配 timeline_seq，并立即提交。
+
+2. Agent 执行期间每产生一个用户可见事件：
+   分配下一个 timeline_seq，写入 execution_events，并提交。
+
+3. 生成最终回答：
+   在一个事务中写入 assistant Message、更新 agent_run 为 completed、
+   更新 session 的 updated_at / last_run_id / last_activity_at，并提交。
+
+4. 执行失败或取消：
+   写入可展示错误事件（如有）、更新 run 状态，并提交。
+```
+
+MVP 是单用户本地使用，但仍由 Storage 在事务内维护每个 session 的递增 `timeline_seq`，而不是仅依赖时间戳排序。
+
+为什么要问：
+这决定重启恢复时能否准确回放会话，也降低断电或异常退出造成的历史丢失。
+
+你的回答：采用上述事务和 timeline_seq 方案。用户输入先保存，用户可见执行事件产生后及时保存，最终回答和 run 状态一起提交。
+
+
+### 问题 14.6：SessionState 的哪些状态需要持久化，哪些只在内存中存在？
+
+通俗解释：
+SessionState 可以包含很多字段，但不是所有运行时对象都能或都应恢复。清楚区分可持久化状态和临时对象，后续 Runtime 接入会更稳定。
+
+建议：
+
+```text
+必须持久化并可恢复：
+  sessions 行的基础字段与 metadata。
+  全部 Message。
+  全部用户可见 ExecutionEvent。
+  agent_run 的状态与关联关系。
+  当前及历史 summary。
+
+可由数据库查询重新计算：
+  messages 列表、message_count、最近消息窗口、
+  last_user_message_id、last_assistant_message_id。
+
+只在内存中存在：
+  SQLite 连接对象、缓存对象、ContextBuildResult、
+  当前模型客户端、正在执行的协程 / Python 栈、
+  未完成工具调用的实时句柄。
+```
+
+为什么要问：
+“重启后恢复 SessionState”指恢复可持续的数据状态，不是错误地序列化无法恢复的进程对象。
+
+你的回答：采用上述边界。需要恢复会话数据、消息、展示事件、摘要和执行状态，不要求恢复进程调用栈或中断时的实时 Python 对象。
+
+
+### 问题 14.7：summary 需要怎样持久化，才能为后续压缩留出空间？
+
+通俗解释：
+MVP 先不做自动摘要，但 summary 一旦有了就不能只放在内存里，否则重启后长会话会失去压缩结果。
+
+建议：
+
+```text
+每一版 summary 写入 session_summaries。
+sessions.current_summary_id 指向当前正在使用的版本。
+summary 记录覆盖到哪一个 timeline_seq，避免下一次压缩重复概括同一段历史。
+MVP 可以只由 SessionManager.update_summary() 手动更新；
+Context 管理增强层再调用 ModelManager.compress_context() 自动生成新版本。
+```
+
+为什么要问：
+保留版本和覆盖范围，能让摘要生成失败时安全回退，也能让上下文压缩逐步升级而不改动数据库结构。
+
+你的回答：采用上述方案。MVP 先保存 summary 字段和版本信息，后续自动压缩时继续复用 SQLite 的 summary 记录。
+
+
+### 问题 14.7.1：summary 是手动更新还是触发阈值后自动更新？
+
+通俗解释：
+summary 就是“较早历史的压缩版”。它不是用户看到的完整聊天记录，而是为了让模型在长对话时仍然知道前面发生过什么。
+
+两种方案的区别：
+
+```text
+手动更新：
+  只有代码显式调用 SessionManager.update_summary() 时才更新。
+  优点：实现简单，不会额外调用模型。
+  缺点：对话一长，如果没有人主动更新，summary 可能一直是空的，
+       ContextBuilder 只能传最近 10 条消息，模型可能忘记更早内容。
+
+触发阈值后自动更新：
+  当消息数量或上下文长度超过阈值时，Memory 自动选择较早历史并调用 Models 层压缩。
+  优点：更像真正的多轮 Agent 记忆；长对话会自动保留前文重点。
+  缺点：需要调用模型，可能失败、变慢或产生额外成本，所以必须有失败降级。
+```
+
+你的选择：
+MVP 采用“触发阈值后自动更新”，但要做得轻量，不能变成复杂长期记忆系统。
+
+建议的 MVP 触发规则：
+
+```text
+max_recent_messages = 10
+summary_trigger_messages = 14
+summary_batch_messages = 6
+
+当一个 session 中 user / assistant 消息数量 > summary_trigger_messages:
+  选择当前 summary 尚未覆盖的较早消息。
+  保留最近 10 条消息不压缩。
+  将更早的 4 到 6 条消息送入 ConversationSummarizer。
+  调用 ModelManager.compress_context() 生成新的 summary。
+  写入 session_summaries 新版本。
+  更新 sessions.current_summary_id。
+```
+
+更通俗地说：
+
+```text
+对话少：
+  不摘要，直接把全部历史给模型。
+
+对话开始变长：
+  把早期对话压缩成 summary。
+  最近 10 条仍然原样保留。
+
+对话继续变长：
+  在旧 summary 基础上继续合并更早但尚未覆盖的历史。
+  不反复压缩最近 10 条。
+```
+
+自动摘要失败时的降级：
+
+```text
+如果 ModelManager.compress_context() 失败：
+  不阻塞本轮对话。
+  保留旧 summary。
+  继续使用最近 10 条消息构建上下文。
+  记录 summary_failed 日志。
+  下轮达到条件时可以再次尝试。
+```
+
+summary 内容要求：
+
+```text
+应该保留：
+  用户长期目标。
+  已确认的设计决策。
+  重要文件路径、项目约束、用户偏好。
+  已完成/未完成任务。
+  用户明确要求后续记住的信息。
+
+不应该写入：
+  隐藏推理。
+  API Key、密码、Cookie、令牌。
+  大段工具原始输出。
+  与后续对话无关的临时过程噪声。
+```
+
+为什么要问：
+这决定“对话超过窗口以后还能不能联系上文”。自动摘要不是保存完整历史的替代品；完整历史仍在 SQLite，summary 只是给模型用的压缩上下文。
+
+你的回答：采用触发阈值后自动更新，调用Model层的相关接口进行上下文压缩。MVP 先用消息数量触发，不做复杂 token 计算；自动摘要失败时不影响本轮对话。
+
+
+### 问题 14.8：SQLite 文件、删除策略和敏感信息的最小边界是什么？
+
+通俗解释：
+本地数据库是完整会话历史，既要能稳定保存，也要避免误删和敏感内容无边界扩散。
+
+建议：
+
+```text
+数据库文件：
+  storage/agent_memory.db
+  数据库目录由配置指定，启动时自动创建。
+
+删除：
+  delete_session(session_id) 默认删除该 session 关联的 messages、
+  agent_runs、execution_events、session_summaries。
+  MVP 不自动清理、不设置过期时间；删除必须由用户显式触发。
+
+敏感信息：
+  默认不持久化密钥、令牌、认证头、Cookie 和隐藏推理。
+  工具参数 / 结果写入 execution_events 前必须经过展示化和脱敏。
+  logs 只记录 id、类型、长度和状态，不重复记录完整正文。
+```
+
+为什么要问：
+这让 MVP 有明确的数据生命周期和安全底线，同时不把多用户权限、加密和云同步提前塞进当前范围。
+
+你的回答：采用上述方案。当前为单用户本地 Agent，删除由用户显式触发，不自动清理历史；敏感信息和隐藏推理不进入普通会话持久化。
+
+
+### 问题 14.9：除了上面三点，还需要补充哪些持久化边界？
+
+通俗解释：
+上面已经定了事件分类、枚举和自动摘要。除此之外，真正实现时还需要避免三个常见问题：流式消息重复保存、事件重复写入、payload 太大。
+
+建议补充以下边界：
+
+```text
+1. 流式消息边界：
+   message_delta 不要每个 token 都写成一条永久 Message。
+   如果后续支持流式输出，Memory 可以先缓存 delta，
+   最终合并成一条 assistant Message 或一个 completed 的 execution_event。
+
+2. 幂等写入边界：
+   event_id、message_id、run_id 必须唯一。
+   SQLite 表对这些 id 加 UNIQUE 约束。
+   同一个事件重复到达时不重复插入，可以忽略或更新原记录状态。
+
+3. payload 大小边界：
+   execution_events.display_content 保存用户可见文本。
+   sanitized_payload_json 只保存脱敏后的摘要。
+   大型原始工具结果不直接进入普通 Memory 数据库；
+   后续如需保存，放 artifact_ref / raw_ref 指向单独产物。
+
+4. 时间字段边界：
+   所有 created_at / updated_at / started_at / finished_at 使用 UTC ISO 字符串。
+   展示层再转换本地时区。
+
+5. 上下文读取边界：
+   ContextBuilder 默认只读取 user / assistant 消息和当前 summary。
+   execution_events 默认只用于会话回放；
+   只有关键工具结果摘要确实影响后续任务时，才少量加入模型上下文。
+```
+
+为什么要问：
+这些不是新功能，而是让 MVP 不容易在真实运行时把数据库写爆、把流式消息写乱、或把同一个事件重复保存多次。
+
+你的回答：采用上述补充边界。Memory MVP 要支持稳定回放和上下文构建，但不把每个内部细节都永久保存为用户聊天历史。
+
+
+### 问题 15：SessionManager 需要提供哪些最小方法？
+
+通俗解释：
+Runtime / CLI / API 不应该自己操作文件，而应该通过 SessionManager 统一管理 session。
+
+建议：
+MVP 方法：
+
+```python
+create_session(session_id: str | None = None) -> SessionState
+load_session(session_id: str) -> SessionState
+get_or_create_session(session_id: str | None = None) -> SessionState
+save_session(session: SessionState) -> None
+delete_session(session_id: str) -> bool
+list_sessions() -> list[SessionInfo]
+append_message(session_id: str, role: str, content: str, metadata: dict | None = None) -> Message
+get_short_term_memory(session_id: str) -> ShortTermMemory
+create_run(session_id: str, user_message_id: str) -> AgentRun
+append_execution_event(session_id: str, run_id: str, event: ExecutionEvent) -> ExecutionEvent
+complete_run(run_id: str, final_message_id: str) -> None
+fail_run(run_id: str, error: MemoryErrorInfo) -> None
+get_session_timeline(session_id: str) -> list[TimelineItem]
+update_summary(session_id: str, summary: str, covered_to_timeline_seq: int) -> SessionSummary
+```
+
+`SessionManager` 负责业务语义；新增的 `SessionStorage` / `SQLiteSessionRepository` 负责 SQL、事务和 schema migration。Runtime / CLI / API 不应直接写 SQL。
+
+暂不做多进程并发、云同步、账号权限和复杂分页；但 SQLite 的单次写入必须使用事务。
+
+为什么要问：
+这决定 Runtime / API 可以依赖哪些稳定接口。
+
+你的回答：采取你的建议，以上对外提供的Session管理/操作接口可行
+
+
+### 问题 16：保存失败时应该中断 Agent 执行，还是降级为内存会话？
+
+通俗解释：
+如果 SQLite 写入失败，Agent 是否还应该回答用户？MVP 阶段要有明确兜底策略。
+
+建议：
+保存失败不应该让本轮回答直接崩掉。建议：
+
+```text
+数据库不存在:
+  初始化 schema 后创建空数据库。
+
+单个 session 不存在:
+  创建空 session，并记录 warning。
+
+单条写入失败:
+  本轮仍返回结果。
+  SessionManager 标记 persistence_warning。
+  Runtime / logs 显示可读错误。
+```
+
+数据库损坏或无法读取建议：
+
+```text
+不覆盖原数据库文件。
+可把错误记录到 logs/memory.log。
+Runtime 返回可读错误；是否允许只读旧缓存或临时内存会话，需要显式标记为“本轮不会持久化”。
+```
+
+为什么要问：
+Memory 是支撑层，不能因为 SQLite 的单次写入失败就让整个 Agent 主链路不可用。
+
+你的回答：采取你的建议，持久化失败不能阻碍对话的继续和agent的执行，这两个是独立的过程
+
+
+---
+
+## 6. Summary 与上下文压缩边界
+
+### 问题 17：MVP 阶段 summary 是“字段和手动存取”，还是马上做自动摘要？
+
+通俗解释：
+自动摘要需要调用模型、处理摘要质量、失败降级和覆盖策略。MVP 阶段先有字段和读写能力即可。
+
+建议：
+MVP 阶段只做：
+
+```text
+SessionState.summary: str
+SessionManager.update_summary(session_id, summary)
+ContextBuilder 使用 summary
+```
+
+不做自动摘要触发。自动摘要放到 Context 管理增强层。
+
+为什么要问：
+这决定 Memory MVP 是否会被压缩策略复杂化。当前目标是多轮上下文和保存恢复。
+
+你的回答：采取你的建议
+
+
+### 问题 18：是否复用 Models 层已有的 compress_context 能力做后续压缩？
+
+通俗解释：
+Models 层已经有 `ModelManager.compress_context()` 和相关 compression 工具。Memory 后续不需要自己写模型调用，只需要组织待压缩消息并调用 Models。
+
+建议：
+后续 Context 管理增强层复用 Models：
+
+```text
+ContextBuilder 检测上下文过长
+  -> ConversationSummarizer 选择早期 messages
+  -> ModelManager.compress_context()
+  -> 更新 SessionState.summary
+  -> 保留 recent_messages
+```
+
+MVP 阶段只预留接口，不实现完整自动压缩。
+
+为什么要问：
+这决定是否重复造模型压缩能力。建议不要重复造，Memory 只做“选择、保存、拼接、降级”。
+
+你的回答：可以复用。之前在Model层做这个模型压缩上下文的功能就是为了这里调用的，这样可以统一由模型层进行控制
+
+
+---
+
+## 7. 日志、测试与验收
+
+### 问题 19：Memory MVP 是否需要独立日志？
+
+通俗解释：
+会话创建、加载、保存、恢复、上下文构建失败等信息，最好有日志。否则后续排查多轮上下文问题会很难。
+
+建议：
+MVP 增加轻量 JSONL 日志：
+
+```text
+logs/memory.log
+```
+
+记录：
+
+```text
+session_created
+session_loaded
+session_saved
+message_appended
+context_built
+persistence_warning
+```
+
+日志里不要写完整敏感内容，最多写 preview、长度、message_id、session_id、数量。
+
+为什么要问：
+Memory bug 往往表现为“模型忘了前文”，没有日志很难定位是没保存、没加载，还是没拼进上下文。
+
+你的回答：需要日志，采取你的建议
+
+
+### 问题 20：Memory MVP 的最小测试应该覆盖哪些场景？
+
+通俗解释：
+Memory 层是否能用，不能只靠手动聊天看感觉，至少要有几个稳定测试。
+
+建议：
+最小测试：
+
+```text
+1. create_session 自动生成 session_id。
+2. 指定 session_id 可以 get_or_create。
+3. append_message 后 get_history 能读到消息。
+4. 最近消息窗口只返回最近 N 条。
+5. 不同 session 消息互不混淆。
+6. 写入 SQLite 后关闭并重新创建 SessionManager，仍能恢复 SessionState、消息和 summary。
+7. messages 与 execution_events 按 timeline_seq 合并后，顺序与写入时的用户可见顺序一致。
+8. 重启后能恢复用户原文、助手最终回答、展示化的执行事件及 run 状态。
+9. 一个 running run 在重启恢复后被标记为 interrupted，不伪装成 completed。
+10. ContextBuilder 输出 summary + 最近 10 条 user / assistant messages。
+11. 空 session 能生成稳定空上下文。
+12. SQLite 损坏、schema 不匹配或写入失败时能返回可读错误且不覆盖原库。
+13. 工具事件持久化前脱敏；密钥类字段不会出现在 messages、events 或日志中。
+```
+
+为什么要问：
+这些测试会成为 Runtime / CLI / API 开发前的安全网。
+
+你的回答：采取你的建议
+
+
+### 问题 21：Memory MVP 完成后，是否先只做 Memory 层单元测试，再进入 Runtime / CLI / API？
+
+通俗解释：
+Memory 先自己跑通，再接 Runtime，会更容易定位问题。否则 import、Runtime、Agent、Memory 混在一起，很难判断哪层坏了。
+
+建议：
+开发顺序：
+
+```text
+1. Memory / Context MVP 单元测试通过。
+2. 修复或兼容 agent 层 import 路径。
+3. Runtime 注入 SessionManager 和 ShortTermMemory。
+4. CLI 多轮对话 smoke test。
+5. API 接口和整体端到端测试。
+```
+
+为什么要问：
+这决定下一轮开发是先写 Memory 纯模块，还是直接接 Agent。建议先纯模块，再接 Runtime。
+
+你的回答：Runtime / CLI / API这个目前还没有开发，所以这里可以预留，后续开发了再做对接
+
+
+---
+
+## 8. 本轮建议默认方案
+
+如果你全部选择“按你的建议来”，则 Memory / Context MVP 的默认方案是：
+
+```text
+定位：
+  Memory 只负责 session 状态、消息历史、summary 和上下文构建。
+
+旧代码：
+  旧 short_term_memory.py / long_term_memory.py 视为占位，可重写或替换。
+
+存储：
+  使用 SQLite：
+  storage/agent_memory.db
+
+  sessions：Session 基本信息和可扩展 metadata。
+  messages：用户和助手实际展示的原始聊天消息。
+  agent_runs：每轮 Agent 执行的开始、结束、失败和关联关系。
+  execution_events：用户实际看到的计划、进度、工具调用摘要、结果摘要、确认和错误。
+  session_summaries：摘要版本和覆盖范围。
+  schema_migrations：数据库 schema 版本。
+
+  SessionState 由上述 SQLite 记录加载并组装，不保存成一个重复的大 JSON。
+
+持久化边界：
+  完整保留用户可见会话时间线，保证重启后可按原顺序回放。
+  不保存隐藏模型推理、密钥、认证信息和未经脱敏的敏感工具原始输出。
+  完整历史长期保存在 SQLite；每轮模型上下文只取 summary + 最近 10 条对话消息 + 当前输入。
+
+事件边界：
+  优先尊重 ReActExecutor 的 ExecutionEvent.visible_to_user。
+  visible_to_user=True 的展示事件进入 execution_events。
+  visible_to_user=False 的内部事件只进日志或后续审计，不进入普通会话回放。
+  message_delta 如用于流式展示，最终合并后保存，不按 token 永久保存。
+
+核心数据：
+  Message
+  SessionState
+  AgentRun
+  ExecutionEvent
+  ContextBuildResult
+  SessionInfo
+  SessionSummary
+
+核心模块：
+  SessionManager
+  ShortTermMemory
+  ContextBuilder
+  SQLiteSessionRepository
+  SessionStorage
+
+上下文策略：
+  MVP 先按消息数量控制 recent_messages。
+  context_text = summary + recent_messages + current_user_input。
+  summary 采用触发阈值后自动更新：对话超过阈值时压缩早期历史，最近 10 条消息原样保留。
+  token 精确统计和更复杂的压缩策略放到下一层。
+
+枚举策略：
+  timeline_seq 在同一 session 内递增，messages 和 execution_events 共用。
+  run_id 表示一次用户输入触发的一轮 Agent 执行。
+  display_type 先使用 chat / final_answer / clarification / confirmation / tool_progress / plan_progress / system_notice / error / summary。
+  run 状态增加 interrupted，用于重启后标记未完成执行。
+
+接入方式：
+  先兼容 ReactAgent 当前 add_message / get_history_text 调用。
+  Runtime 阶段再把 session_id 注入 Agent。
+
+验收：
+  Memory 单元测试先通过。
+  再进入 Runtime / CLI / API 层。
+```
+
+本轮结束后，如果这些问题回答完成，下一步应生成：
+
+```text
+src/memory/Memory层设计决策汇总.md
+src/memory/Memory层开发步骤与进度.md 的更新版
+```
+
+然后进入 Memory / Context MVP 的代码实现。

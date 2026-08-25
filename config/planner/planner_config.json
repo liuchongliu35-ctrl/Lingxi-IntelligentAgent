@@ -1,0 +1,9 @@
+{
+  "max_plan_steps": 20,
+  "max_task_units": 6,
+  "max_llm_repair_attempts": 3,
+  "default_step_max_retries": 3,
+  "enable_llm_planner": true,
+  "enable_shell_fallback_plan": false,
+  "planner_log_path": "logs/planner.log"
+}

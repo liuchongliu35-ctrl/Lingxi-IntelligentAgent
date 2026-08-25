@@ -1,0 +1,400 @@
+# Planner 设计问题回答（3）：意图、任务、步骤关系确认
+
+本文档用于第三轮确认 Planner 的核心抽象：`Intent`、`Task`、`PlanStep` 之间到底是什么关系。
+
+背景：
+你提出的问题是：
+
+```text
+用户输入里有多个意图时，Planner 是制定一份整体计划，
+还是先把每个任务分别生成计划，再让 Executor 用 ReAct 循环执行？
+
+意图和任务之间是什么关系？
+一个意图对应一个任务？
+多个意图对应一个任务？
+还是一个意图可能拆成多个任务？
+```
+
+这个问题会直接影响 Planner 的数据结构，所以需要单独确认。
+
+---
+
+## 1. 推荐结论
+
+建议采用下面这套关系：
+
+```text
+一次用户输入
+  -> 一个 TaskPlan 总计划
+      -> 多个 TaskUnit 子任务
+          -> 多个 PlanStep 执行步骤
+```
+
+同时：
+
+```text
+Intent 不等于 Task
+Task 不等于 Step
+```
+
+通俗解释：
+
+- `Intent` 是 Analyzer 识别出来的“用户想做什么类型的事”，例如 `search`、`summarize`、`write_file`。
+- `TaskUnit` 是 Planner 整理出来的“一个可完成的任务单元”，可能包含一个或多个 intent。
+- `PlanStep` 是 Executor 可以执行的具体步骤。
+
+例子：
+
+```text
+用户输入：搜索 FastAPI 测试方案，总结后写入 docs/test.md
+
+Analyzer:
+intent_sequence = ["search", "summarize", "write_file"]
+
+Planner:
+TaskPlan: 完成用户这次请求
+  TaskUnit task_1: 生成 FastAPI 测试方案文档
+    step_1: 搜索 FastAPI 测试方案
+    step_2: 总结搜索结果
+    step_3: 写入 docs/test.md
+```
+
+这里是：
+
+```text
+多个 intent -> 一个 TaskUnit -> 多个 PlanStep
+```
+
+---
+
+## 2. 第一类关系：一个 intent 对应一个 task
+
+例子：
+
+```text
+用户输入：计算 2+3*4
+```
+
+关系：
+
+```text
+intent: calculate
+task: 完成一次计算
+steps:
+  step_1: 调用 math_calculator
+```
+
+这种是最简单的 micro 任务。
+
+### 问题 1：你是否认可这类简单任务按“一个 intent -> 一个 task -> 一个 step”处理？
+
+建议：认可。
+
+你的回答：认可
+
+
+---
+
+## 3. 第二类关系：多个 intent 合成一个 task
+
+例子：
+
+```text
+用户输入：搜索大模型资料，总结重点，并写成 Markdown 报告
+```
+
+关系：
+
+```text
+intents: search + summarize + write_file
+task: 生成一份大模型资料 Markdown 报告
+steps:
+  step_1: 搜索资料
+  step_2: 总结资料
+  step_3: 写入文件
+```
+
+这里不是三个完全独立任务，而是一个流水线任务。
+
+### 问题 2：你是否认可 `search + summarize + write_file` 这类强依赖多意图合并成一个 TaskUnit？
+
+建议：认可。
+
+你的回答：认可
+
+
+### 问题 3：这类强依赖任务是否应该由 Planner 生成一份连续步骤，而不是每个 intent 单独生成一份计划？
+
+建议：是。否则 Executor 很难知道搜索结果要传给总结，再传给写文件。
+
+你的回答：是
+
+
+---
+
+## 4. 第三类关系：多个 intent 对应多个 task
+
+例子：
+
+```text
+用户输入：读取 a.pdf 总结重点，同时把 b.csv 统计一下
+```
+
+关系：
+
+```text
+TaskUnit task_1: 总结 a.pdf
+  step_1: read_file a.pdf
+  step_2: summarize
+
+TaskUnit task_2: 统计 b.csv
+  step_3: read_file b.csv
+  step_4: analyze
+```
+
+这里是两个相对独立任务。
+
+### 问题 4：如果用户一次提出多个相互独立的任务，Planner 是否应该生成多个 TaskUnit？
+
+建议：是。仍然放在同一个 TaskPlan 里，但按 `task_1/task_2` 分组。
+
+你的回答：是
+
+
+### 问题 5：独立 TaskUnit 在 V1 是否先顺序执行，不做并行？
+
+建议：V1 顺序执行。并行执行属于 V2/V3。
+
+你的回答：V1先顺序执行吧，V1主要先可以跑再说后面的优化
+
+
+---
+
+## 5. 第四类关系：一个 intent 拆成多个 task 或多个 step
+
+例子：
+
+```text
+用户输入：帮我设计一个客户管理系统
+```
+
+Analyzer 可能只识别：
+
+```text
+intent = design_project
+```
+
+但 Planner 可以拆成：
+
+```text
+TaskUnit task_1: 明确需求边界
+TaskUnit task_2: 设计功能模块
+TaskUnit task_3: 设计数据模型
+TaskUnit task_4: 设计接口和页面流程
+TaskUnit task_5: 输出开发计划
+```
+
+也可以在 V1 里先拆成多个步骤：
+
+```text
+step_1: 分析需求
+step_2: 设计模块
+step_3: 设计数据结构
+step_4: 输出方案
+```
+
+### 问题 6：你是否认可一个复杂 intent 可以拆成多个 TaskUnit 或多个 PlanStep？
+
+建议：认可。
+
+你的回答：认可
+
+
+### 问题 7：软件工程类复杂任务，V1 是拆成多个 PlanStep 就够了，还是要拆成多个 TaskUnit？
+
+建议：
+V1 先拆成多个 PlanStep；如果任务明显包含多个阶段，再拆 TaskUnit。
+
+例子：
+
+```text
+“设计一个系统” -> 一个 TaskUnit，多个 PlanStep
+“设计系统并生成测试计划和部署方案” -> 多个 TaskUnit
+```
+
+你的回答：我一般不会直接让你从0到1去完成一个软件工程的任务，我一般会先把设计做好，然后让你一个模块一个模块的去进行开发任务，
+一般直接一个对话里面就让你直接生成一个系统这种情况一般不会有，所以我一般是人工按照软件工程开发步骤去拆分，
+然后会分对话去让你帮我完成我本次对话需要你完成的软件工程开发的某一个步骤，比如开发模块a，或者修改xxx bug类似这样的
+不过是拆成成多个 PlanStep还是拆成 TaskUnit这个也需要设计一下，根据具体的任务复杂度来吧，
+如果任务明显包含多个阶段比如用户输入“先xxx再xxx最后xxx”这种大模型检测出来是包含多个阶段的那就拆成TaskUnit，如果只有一个阶段就可以完成的那就直接拆成多个PlanStep步骤
+
+
+---
+
+## 6. Planner 最终输出结构
+
+建议 Planner V1 输出：
+
+```text
+TaskPlan
+  plan_id
+  goal
+  mode
+  task_type
+  execution_strategy
+  source_trace_id
+  task_units
+  steps
+  required_tools
+  missing_tools
+  can_execute
+  risk_policy
+  planning_strategy
+  user_facing_summary
+```
+
+其中：
+
+```text
+task_units: 用于表达“任务分组”
+steps: 扁平步骤列表，方便 Executor 顺序执行
+```
+
+为什么同时要 `task_units` 和 `steps`？
+
+- `task_units` 方便人理解和 UI 展示。
+- `steps` 方便 Executor 执行。
+
+### 问题 8：你是否认可 TaskPlan 同时保留 `task_units` 和扁平 `steps`？
+
+建议：认可。
+
+你的回答：认可
+
+
+### 问题 9：PlanStep 是否需要字段 `task_id`，标记这个步骤属于哪个 TaskUnit？
+
+建议：需要。
+
+例子：
+
+```text
+step_1.task_id = "task_1"
+step_2.task_id = "task_1"
+step_3.task_id = "task_2"
+```
+
+你的回答：需要
+
+
+### 问题 10：TaskUnit 是否需要字段 `intent_refs`，表示这个任务由哪些 intent 组成？
+
+建议：需要。
+
+例子：
+
+```text
+TaskUnit task_1:
+  intent_refs = ["search", "summarize", "write_file"]
+```
+
+你的回答：需要
+
+
+---
+
+## 7. ReAct Executor 如何消费这些结构
+
+推荐方式：
+
+```text
+Executor 接收一个 TaskPlan
+  -> 按 task_units 顺序处理
+  -> 每个 TaskUnit 内按 steps 顺序处理
+  -> 每个 step 执行时走 ReAct 小循环
+```
+
+也就是：
+
+```text
+TaskPlan 是总地图
+TaskUnit 是一段任务
+PlanStep 是当前要走的一步
+ReAct 循环是每一步怎么执行、观察、判断、继续
+```
+
+### 问题 11：你是否认可 Executor 按 TaskUnit 顺序执行，每个 TaskUnit 内按 PlanStep 顺序执行？
+
+建议：认可。
+
+你的回答：认可
+
+
+### 问题 12：ReAct 循环是在每个 PlanStep 内部运行，还是每个 TaskUnit 内部运行？
+
+选项：
+
+```text
+A. 每个 PlanStep 内运行一次小循环
+B. 每个 TaskUnit 内运行一个较大的循环
+C. V1 按 PlanStep 小循环，V2 再支持 TaskUnit 级循环
+```
+
+建议：选 C。V1 更容易实现和测试。
+
+你的回答：C
+
+
+---
+
+## 8. 计划生成方式
+
+### 问题 13：Planner 生成 TaskUnit 时，是规则优先还是 LLM 优先？
+
+建议：
+
+```text
+1. 特殊策略：规则硬处理
+2. 明确常见流水线：规则生成 TaskUnit
+3. 软件工程/开放复杂任务：LLM 生成 TaskUnit 和 steps
+4. LLM 结果必须校验
+```
+
+你的回答：规则优先，规则可以过滤出来的任务类型就直接只有规则来制定执行计划，不需要使用大模型，但是规则没有过滤出来的那就使用大模型来制定计划，一般规则过滤的都是一些简单的需求
+
+
+### 问题 14：如果 LLM 生成的 TaskUnit 和 Analyzer 的 intent_sequence 不一致，怎么处理？
+
+选项：
+
+```text
+A. 以 LLM 为准
+B. 以 Analyzer 为准
+C. 允许 LLM 调整，但必须在 plan_validation_notes 中说明原因
+```
+
+建议：选 C。Planner 可以纠正 Analyzer，但必须可追踪。
+
+你的回答：A，把Analyzer的建议给大模型，作为参考而已，具体还是需要靠大模型这颗大脑来指挥，毕竟Analyzer的只是初步计划肯定是不准确的
+
+
+### 问题 15：Planner 是否允许补充 Analyzer 没识别出来但完成任务必需的步骤？
+
+例子：
+
+```text
+用户说：总结搜索结果写成报告
+Analyzer 识别：summarize + write_file
+Planner 判断：缺少资料来源，需要先 search 或 ask_user
+```
+
+建议：
+允许，但必须记录：
+
+```text
+added_steps_reason
+plan_validation_notes
+```
+
+你的回答：这个肯定需要，因为大模型才是agent大脑，这个大脑才是可以识别所有灵活情况的中枢，所有的规则出来的东西都只不过是补充而已，大脑可以根据实际情况来进行决策和调整
+

@@ -1,0 +1,30 @@
+{
+  "default_permissions": {
+    "allow_read_workspace": true,
+    "allow_write_workspace": false,
+    "allow_network": false,
+    "allow_command": false,
+    "allow_shell_command": false,
+    "allow_mcp": false
+  },
+  "risk_policy": {
+    "low": "allow",
+    "medium": "allow",
+    "high": "confirm",
+    "blocked": "block"
+  },
+  "sensitive_paths": [
+    ".env",
+    ".env.*",
+    "secrets",
+    "credentials"
+  ],
+  "blocked_paths": [],
+  "ignored_directories": [
+    ".git",
+    "__pycache__",
+    "node_modules"
+  ],
+  "blocked_tools": [],
+  "blocked_scopes": []
+}

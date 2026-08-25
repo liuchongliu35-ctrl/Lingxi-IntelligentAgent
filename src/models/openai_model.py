@@ -1,69 +1,34 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-OpenAI模型
-接入OpenAI大模型API
-"""
+from __future__ import annotations
 
-import os
-import openai
-from typing import Optional, Dict, Any, Generator
+from typing import Any
 
-from src.models.base_model import BaseModel
+from src.models.config import ProviderConf
+from src.models.credentials import CredentialResolution, resolve_credential_secret
+from src.models.providers.openai_compatible import (
+    OpenAICompatibleModel,
+    OpenAICompatibleProvider,
+    configured_builtin_provider_conf,
+)
 
 
-class OpenAIModel(BaseModel):
-    """OpenAI模型"""
-    
-    def __init__(self):
-        """初始化OpenAI模型"""
-        self.api_key = os.getenv("OPENAI_API_KEY")
-        if not self.api_key:
-            raise ValueError("请设置OPENAI_API_KEY环境变量")
-        
-        openai.api_key = self.api_key
-    
-    def generate(self, prompt: str, **kwargs) -> str:
-        """生成文本
-        
-        Args:
-            prompt: 提示词
-            **kwargs: 其他参数
-            
-        Returns:
-            生成的文本
-        """
-        response = openai.chat.completions.create(
-            model=kwargs.get("model", "gpt-3.5-turbo"),
-            messages=[
-                {"role": "user", "content": prompt}
-            ],
-            temperature=kwargs.get("temperature", 0.7),
-            max_tokens=kwargs.get("max_tokens", 1000)
+class OpenAIModel(OpenAICompatibleModel):
+    """Compatibility wrapper for the configured OpenAI-compatible adapter."""
+
+    def __init__(
+        self,
+        *,
+        provider_conf: ProviderConf | None = None,
+        credential: CredentialResolution | None = None,
+        client_factory: Any | None = None,
+        client: Any | None = None,
+    ):
+        conf = provider_conf or configured_builtin_provider_conf("openai")
+        resolved_credential = credential or resolve_credential_secret(conf.credentials[0])
+        super().__init__(
+            OpenAICompatibleProvider(
+                conf,
+                resolved_credential,
+                client_factory=client_factory,
+                client=client,
+            )
         )
-        
-        return response.choices[0].message.content
-    
-    def stream_generate(self, prompt: str, **kwargs) -> Generator[str, None, None]:
-        """流式生成文本
-        
-        Args:
-            prompt: 提示词
-            **kwargs: 其他参数
-            
-        Returns:
-            生成的文本流
-        """
-        response = openai.chat.completions.create(
-            model=kwargs.get("model", "gpt-3.5-turbo"),
-            messages=[
-                {"role": "user", "content": prompt}
-            ],
-            temperature=kwargs.get("temperature", 0.7),
-            max_tokens=kwargs.get("max_tokens", 1000),
-            stream=True
-        )
-        
-        for chunk in response:
-            if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
-                yield chunk.choices[0].delta.content

@@ -1,0 +1,530 @@
+[
+  {
+    "id": "calculate_single_tool_success",
+    "description": "calculate single-step tool success",
+    "plan": {
+      "goal": "calculate",
+      "steps": [
+        {"id": "step_1", "description": "Calculate.", "step_type": "tool", "tool_name": "math_calculator", "args": {"expression": "2+3"}, "output_key": "calculation"}
+      ]
+    },
+    "operations": [
+      {"type": "dispatch", "action_type": "call_tool", "target": "math_calculator", "step_id": "step_1", "args": {"expression": "2+3"}},
+      {"type": "set_step_status", "step_id": "step_1", "status": "completed"},
+      {"type": "build_result", "status": "completed", "success": true}
+    ],
+    "expect": {
+      "status": "completed",
+      "success": true,
+      "observation_count": 1,
+      "tool_call_count": 1,
+      "model_call_count": 0,
+      "events_include": ["action_selected", "tool_started", "tool_finished", "observation_created"],
+      "output_contains": ["Succeeded:", "step_1/math_calculator", "Next: no further action is required"],
+      "log_record_types_include": ["action_packet", "safety_decision", "observation"]
+    }
+  },
+  {
+    "id": "model_respond_success",
+    "description": "model action returns intermediate result",
+    "model_responses": ["model answer"],
+    "plan": {
+      "goal": "respond",
+      "steps": [
+        {"id": "step_1", "description": "Respond.", "step_type": "respond"}
+      ]
+    },
+    "operations": [
+      {"type": "dispatch", "action_type": "call_model", "step_id": "step_1", "args": {"goal": "summarize", "input": "content", "output_requirements": "short"}},
+      {"type": "set_step_status", "step_id": "step_1", "status": "completed"},
+      {"type": "build_result", "status": "completed", "success": true}
+    ],
+    "expect": {
+      "status": "completed",
+      "success": true,
+      "tool_call_count": 0,
+      "model_call_count": 1,
+      "events_include": ["progress_message", "message_delta", "observation_created"],
+      "output_contains": ["model answer"],
+      "log_record_types_include": ["action_packet", "model_prompt", "observation"]
+    }
+  },
+  {
+    "id": "read_file_then_summarize",
+    "description": "read file output is injected into text processor",
+    "plan": {
+      "goal": "read and summarize",
+      "steps": [
+        {"id": "step_1", "description": "Read.", "step_type": "tool", "tool_name": "document_parser", "args": {"file_path": "README.md"}, "output_key": "doc"},
+        {"id": "step_2", "description": "Summarize.", "step_type": "tool", "tool_name": "text_processor", "args": {"operation": "summary"}, "input_from": ["doc"], "output_key": "summary"}
+      ]
+    },
+    "operations": [
+      {"type": "dispatch", "action_type": "call_tool", "target": "document_parser", "step_id": "step_1", "args": {"file_path": "README.md"}},
+      {"type": "dispatch", "action_type": "call_tool", "target": "text_processor", "step_id": "step_2", "args": {"operation": "summary"}},
+      {"type": "set_step_status", "step_id": "step_1", "status": "completed"},
+      {"type": "set_step_status", "step_id": "step_2", "status": "completed"},
+      {"type": "build_result", "status": "completed", "success": true}
+    ],
+    "expect": {
+      "status": "completed",
+      "success": true,
+      "observation_count": 2,
+      "tool_call_count": 2,
+      "tool_calls_include": ["document_parser", "text_processor"],
+      "output_contains": ["Succeeded:", "step_2/text_processor"]
+    }
+  },
+  {
+    "id": "read_extract_write",
+    "description": "read file, extract text, then write file",
+    "plan": {
+      "goal": "extract and write",
+      "steps": [
+        {"id": "step_1", "description": "Read.", "step_type": "tool", "tool_name": "document_parser", "args": {"file_path": "README.md"}, "output_key": "doc"},
+        {"id": "step_2", "description": "Extract.", "step_type": "tool", "tool_name": "text_processor", "args": {"operation": "extract"}, "input_from": ["doc"], "output_key": "extract"},
+        {"id": "step_3", "description": "Write.", "step_type": "tool", "tool_name": "file_writer", "args": {"file_path": "out.txt", "content": "placeholder"}, "input_from": ["extract"], "output_key": "written"}
+      ]
+    },
+    "operations": [
+      {"type": "dispatch", "action_type": "call_tool", "target": "document_parser", "step_id": "step_1", "args": {"file_path": "README.md"}},
+      {"type": "dispatch", "action_type": "call_tool", "target": "text_processor", "step_id": "step_2", "args": {"operation": "extract"}},
+      {"type": "dispatch", "action_type": "call_tool", "target": "file_writer", "step_id": "step_3", "args": {"file_path": "out.txt"}},
+      {"type": "set_step_status", "step_id": "step_1", "status": "completed"},
+      {"type": "set_step_status", "step_id": "step_2", "status": "completed"},
+      {"type": "set_step_status", "step_id": "step_3", "status": "completed"},
+      {"type": "build_result", "status": "completed", "success": true}
+    ],
+    "expect": {
+      "status": "completed",
+      "success": true,
+      "observation_count": 3,
+      "tool_call_count": 3,
+      "output_contains": ["step_3/file_writer"]
+    }
+  },
+  {
+    "id": "tool_failure_retry_success",
+    "description": "failed tool action is retried successfully",
+    "tool_results": {
+      "math_calculator": [
+        {"success": false, "message": "temporary timeout", "code": "timeout"},
+        {"success": true, "data": "5", "message": "5"}
+      ]
+    },
+    "plan": {
+      "goal": "retry",
+      "steps": [
+        {"id": "step_1", "description": "Calculate.", "step_type": "tool", "tool_name": "math_calculator", "args": {"expression": "2+3"}, "retryable": true, "max_retries": 2}
+      ]
+    },
+    "operations": [
+      {"type": "dispatch", "action_type": "call_tool", "target": "math_calculator", "step_id": "step_1", "args": {"expression": "2+3"}},
+      {"type": "dispatch", "action_type": "retry_step", "step_id": "step_1", "args": {"step_id": "step_1"}},
+      {"type": "set_step_status", "step_id": "step_1", "status": "completed"},
+      {"type": "build_result", "status": "completed", "success": true}
+    ],
+    "expect": {
+      "status": "completed",
+      "success": true,
+      "observation_count": 2,
+      "tool_call_count": 2,
+      "events_include": ["retry_scheduled", "retry_finished"],
+      "output_contains": ["Succeeded:"]
+    }
+  },
+  {
+    "id": "fallback_to_model",
+    "description": "primary tool failure falls back to model",
+    "tool_results": {
+      "primary_tool": [{"success": false, "message": "primary failed", "code": "tool_execution_failed"}]
+    },
+    "model_responses": ["model fallback result"],
+    "plan": {
+      "goal": "fallback model",
+      "steps": [
+        {"id": "step_1", "description": "Run primary.", "step_type": "tool", "tool_name": "primary_tool", "args": {"query": "topic"}, "allow_model_reasoning": true, "output_key": "result"}
+      ]
+    },
+    "operations": [
+      {"type": "dispatch", "action_type": "call_tool", "target": "primary_tool", "step_id": "step_1", "args": {"query": "topic"}},
+      {"type": "dispatch", "action_type": "fallback_to_model", "step_id": "step_1", "args": {"step_id": "step_1", "fallback_reason": "primary failed"}},
+      {"type": "set_step_status", "step_id": "step_1", "status": "completed"},
+      {"type": "build_result", "status": "completed", "success": true}
+    ],
+    "expect": {
+      "status": "completed",
+      "success": true,
+      "fallback_used_count": 1,
+      "tool_call_count": 1,
+      "model_call_count": 1,
+      "events_include": ["fallback_started", "fallback_finished"],
+      "output_contains": ["Fallback used:", "via model"]
+    }
+  },
+  {
+    "id": "fallback_to_tool",
+    "description": "primary tool failure falls back to fallback tool",
+    "tool_results": {
+      "primary_tool": [{"success": false, "message": "primary failed", "code": "tool_execution_failed"}],
+      "fallback_tool": [{"success": true, "data": "fallback data", "message": "fallback ok"}]
+    },
+    "plan": {
+      "goal": "fallback tool",
+      "steps": [
+        {"id": "step_1", "description": "Run primary.", "step_type": "tool", "tool_name": "primary_tool", "args": {"query": "topic"}, "fallback_tools": ["fallback_tool"], "output_key": "result"}
+      ]
+    },
+    "operations": [
+      {"type": "dispatch", "action_type": "call_tool", "target": "primary_tool", "step_id": "step_1", "args": {"query": "topic"}},
+      {"type": "dispatch", "action_type": "fallback_to_tool", "target": "fallback_tool", "step_id": "step_1", "args": {"step_id": "step_1", "fallback_reason": "primary failed"}},
+      {"type": "set_step_status", "step_id": "step_1", "status": "completed"},
+      {"type": "build_result", "status": "completed", "success": true}
+    ],
+    "expect": {
+      "status": "completed",
+      "success": true,
+      "fallback_used_count": 1,
+      "tool_call_count": 2,
+      "tool_calls_include": ["primary_tool", "fallback_tool"],
+      "output_contains": ["Fallback used:", "via tool"]
+    }
+  },
+  {
+    "id": "command_confirmation_requested",
+    "description": "command action pauses for confirmation before tool execution",
+    "plan": {
+      "goal": "command",
+      "available_tools": ["command_tool"],
+      "steps": [
+        {"id": "step_1", "description": "Run command.", "step_type": "tool", "tool_name": "command_tool", "args": {}, "requires_confirmation": true}
+      ]
+    },
+    "operations": [
+      {"type": "dispatch", "action_type": "call_tool", "target": "command_tool", "step_id": "step_1", "args": {"command": "python --version", "cwd": ".", "purpose": "diagnostic", "risk_level": "low", "requires_confirmation": true, "expected_result": "command completes successfully", "timeout_seconds": 5}},
+      {"type": "build_result", "status": "waiting_user", "success": false}
+    ],
+    "expect": {
+      "status": "waiting_user",
+      "success": false,
+      "requires_user_input": true,
+      "tool_call_count": 0,
+      "events_include": ["confirmation_requested"],
+      "events_exclude": ["command_started"],
+      "output_contains": ["Waiting for user:"]
+    }
+  },
+  {
+    "id": "confirmation_reject_skips_dependent",
+    "description": "user rejects confirmation and dependent step is skipped",
+    "plan": {
+      "goal": "confirm reject",
+      "steps": [
+        {"id": "step_1", "description": "Calculate.", "step_type": "tool", "tool_name": "math_calculator", "args": {"expression": "2+3"}, "requires_confirmation": true, "output_key": "calculation"},
+        {"id": "step_2", "description": "Write.", "step_type": "tool", "tool_name": "file_writer", "args": {"file_path": "out.txt", "content": "x"}, "depends_on": ["step_1"], "input_from": ["calculation"]}
+      ]
+    },
+    "operations": [
+      {"type": "dispatch", "action_type": "call_tool", "target": "math_calculator", "step_id": "step_1", "args": {"expression": "2+3"}, "requires_confirmation": true},
+      {"type": "handle_confirmation", "approved": false, "reason": "No"},
+      {"type": "build_result", "status": "blocked", "success": false}
+    ],
+    "expect": {
+      "status": "blocked",
+      "success": false,
+      "requires_user_input": false,
+      "tool_call_count": 0,
+      "step_statuses": {"step_1": "cancelled", "step_2": "skipped"},
+      "output_contains": ["Skipped:", "step_2"]
+    }
+  },
+  {
+    "id": "plan_can_execute_false",
+    "description": "non-executable plan does not run tools",
+    "plan": {
+      "goal": "blocked plan",
+      "can_execute": false,
+      "mode": "blocked",
+      "steps": [
+        {"id": "step_1", "description": "Calculate.", "step_type": "tool", "tool_name": "math_calculator", "args": {"expression": "2+3"}}
+      ]
+    },
+    "operations": [{"type": "execute"}],
+    "expect": {
+      "status": "blocked",
+      "success": false,
+      "tool_call_count": 0,
+      "error_code": "plan_not_executable",
+      "output_contains": ["Plan is not executable"]
+    }
+  },
+  {
+    "id": "invalid_plan",
+    "description": "invalid plan fails before traversal",
+    "plan": {
+      "goal": "invalid",
+      "plan_validation_status": "invalid",
+      "plan_validation_notes": ["bad dependency"],
+      "steps": [
+        {"id": "step_1", "description": "Calculate.", "step_type": "tool", "tool_name": "math_calculator", "args": {"expression": "2+3"}}
+      ]
+    },
+    "operations": [{"type": "execute"}],
+    "expect": {
+      "status": "failed",
+      "success": false,
+      "tool_call_count": 0,
+      "error_code": "invalid_plan",
+      "events_exclude": ["step_started"],
+      "output_contains": ["Plan validation failed"]
+    }
+  },
+  {
+    "id": "input_from_missing",
+    "description": "missing input_from reference returns structured failure",
+    "plan": {
+      "goal": "missing input",
+      "steps": [
+        {"id": "step_1", "description": "Summarize.", "step_type": "tool", "tool_name": "text_processor", "args": {"operation": "summary"}, "input_from": ["missing_output"]}
+      ]
+    },
+    "operations": [
+      {"type": "dispatch", "action_type": "call_tool", "target": "text_processor", "step_id": "step_1", "args": {"operation": "summary"}},
+      {"type": "set_step_status", "step_id": "step_1", "status": "failed"},
+      {"type": "build_result", "status": "failed", "success": false}
+    ],
+    "expect": {
+      "status": "failed",
+      "success": false,
+      "latest_observation_code": "tool_input_ref_missing",
+      "tool_call_count": 0,
+      "output_contains": ["missing_output", "Failed:"]
+    }
+  },
+  {
+    "id": "action_packet_schema_invalid",
+    "description": "invalid ActionPacket produces schema validation observation",
+    "plan": {
+      "goal": "schema invalid",
+      "steps": [
+        {"id": "step_1", "description": "Respond.", "step_type": "respond"}
+      ]
+    },
+    "operations": [
+      {"type": "dispatch", "action_type": "call_model", "step_id": "step_1", "args": {"goal": "missing required fields"}},
+      {"type": "set_step_status", "step_id": "step_1", "status": "failed"},
+      {"type": "build_result", "status": "failed", "success": false}
+    ],
+    "expect": {
+      "status": "failed",
+      "success": false,
+      "latest_observation_code": "action_packet_invalid",
+      "model_call_count": 0,
+      "log_record_types_include": ["action_packet", "observation"],
+      "output_contains": ["call_model requires"]
+    }
+  },
+  {
+    "id": "request_replan",
+    "description": "model requests replan through structured action",
+    "plan": {
+      "goal": "replan",
+      "steps": [
+        {"id": "step_1", "description": "Request replan.", "step_type": "respond"}
+      ]
+    },
+    "operations": [
+      {"type": "dispatch", "action_type": "request_replan", "step_id": "step_1", "request_replan_reason": "tool contract changed"},
+      {"type": "build_result", "status": "request_replan", "success": false}
+    ],
+    "expect": {
+      "status": "request_replan",
+      "success": false,
+      "request_replan": true,
+      "replan_reason_contains": "tool contract changed",
+      "events_include": ["request_replan"],
+      "output_contains": ["Replan requested:", "ask Planner for a revised TaskPlan"]
+    }
+  },
+  {
+    "id": "file_write_success",
+    "description": "file writer action succeeds inside workspace",
+    "plan": {
+      "goal": "write file",
+      "steps": [
+        {"id": "step_1", "description": "Write.", "step_type": "tool", "tool_name": "file_writer", "args": {"file_path": "out.txt", "content": "data"}}
+      ]
+    },
+    "operations": [
+      {"type": "dispatch", "action_type": "call_tool", "target": "file_writer", "step_id": "step_1", "args": {"file_path": "out.txt", "content": "data"}},
+      {"type": "set_step_status", "step_id": "step_1", "status": "completed"},
+      {"type": "build_result", "status": "completed", "success": true}
+    ],
+    "expect": {
+      "status": "completed",
+      "success": true,
+      "tool_call_count": 1,
+      "tool_calls_include": ["file_writer"],
+      "output_contains": ["step_1/file_writer"]
+    }
+  },
+  {
+    "id": "task_policy_block",
+    "description": "task block policy prevents execution",
+    "task": {"action_policy": "block"},
+    "plan": {
+      "goal": "blocked by task",
+      "steps": [
+        {"id": "step_1", "description": "Calculate.", "step_type": "tool", "tool_name": "math_calculator", "args": {"expression": "2+3"}}
+      ]
+    },
+    "operations": [{"type": "execute"}],
+    "expect": {
+      "status": "blocked",
+      "success": false,
+      "tool_call_count": 0,
+      "error_code": "task_policy_blocked",
+      "output_contains": ["Task policy blocks execution"]
+    }
+  },
+  {
+    "id": "partial_failure",
+    "description": "one step succeeds and another fails",
+    "tool_results": {
+      "file_writer": [{"success": false, "message": "write failed", "code": "file_exists"}]
+    },
+    "plan": {
+      "goal": "partial",
+      "steps": [
+        {"id": "step_1", "description": "Calculate.", "step_type": "tool", "tool_name": "math_calculator", "args": {"expression": "2+3"}},
+        {"id": "step_2", "description": "Write.", "step_type": "tool", "tool_name": "file_writer", "args": {"file_path": "out.txt", "content": "x"}}
+      ]
+    },
+    "operations": [
+      {"type": "dispatch", "action_type": "call_tool", "target": "math_calculator", "step_id": "step_1", "args": {"expression": "2+3"}},
+      {"type": "dispatch", "action_type": "call_tool", "target": "file_writer", "step_id": "step_2", "args": {"file_path": "out.txt", "content": "x"}},
+      {"type": "set_step_status", "step_id": "step_1", "status": "completed"},
+      {"type": "set_step_status", "step_id": "step_2", "status": "failed", "error_code": "file_exists"},
+      {"type": "build_result", "status": "failed", "success": false}
+    ],
+    "expect": {
+      "status": "failed",
+      "success": false,
+      "tool_call_count": 2,
+      "latest_observation_code": "file_exists",
+      "output_contains": ["Succeeded:", "Failed:", "write failed"]
+    }
+  },
+  {
+    "id": "forbidden_path_blocked",
+    "description": "explicit forbidden path blocks file writing",
+    "task": {"forbidden_paths": ["protected.txt"]},
+    "plan": {
+      "goal": "forbidden file",
+      "steps": [
+        {"id": "step_1", "description": "Write.", "step_type": "tool", "tool_name": "file_writer", "args": {"file_path": "protected.txt", "content": "data"}}
+      ]
+    },
+    "operations": [
+      {"type": "dispatch", "action_type": "call_tool", "target": "file_writer", "step_id": "step_1", "args": {"file_path": "protected.txt", "content": "data"}, "confirmed": true},
+      {"type": "set_step_status", "step_id": "step_1", "status": "blocked", "error_code": "safety_blocked", "message": "Path is explicitly forbidden: protected.txt."},
+      {"type": "build_result", "status": "blocked", "success": false}
+    ],
+    "expect": {
+      "status": "blocked",
+      "success": false,
+      "latest_observation_code": "safety_blocked",
+      "tool_call_count": 0,
+      "output_contains": ["explicitly forbidden", "Blocked:"]
+    }
+  },
+  {
+    "id": "missing_tool_precheck",
+    "description": "Planner asks for a tool unavailable in registry",
+    "plan": {
+      "goal": "missing tool",
+      "available_tools": ["search_tool"],
+      "steps": [
+        {"id": "step_1", "description": "Search.", "step_type": "tool", "tool_name": "search_tool", "args": {"query": "agent"}}
+      ]
+    },
+    "operations": [{"type": "execute"}],
+    "expect": {
+      "status": "failed",
+      "success": false,
+      "error_code": "tool_not_available",
+      "failed_step_id": "step_1",
+      "tool_call_count": 0,
+      "events_exclude": ["tool_started"],
+      "output_contains": ["tool is not available"]
+    }
+  },
+  {
+    "id": "finish_action_final_answer",
+    "description": "finish action is summarized as completed",
+    "plan": {
+      "goal": "finish",
+      "steps": [
+        {"id": "step_1", "description": "Finish.", "step_type": "respond"}
+      ]
+    },
+    "operations": [
+      {"type": "dispatch", "action_type": "finish", "step_id": "step_1", "final_answer": "done"},
+      {"type": "set_step_status", "step_id": "step_1", "status": "completed"},
+      {"type": "build_result", "status": "completed", "success": true}
+    ],
+    "expect": {
+      "status": "completed",
+      "success": true,
+      "events_include": ["final_answer"],
+      "output_contains": ["done", "Succeeded:"]
+    }
+  },
+  {
+    "id": "fallback_tool_unavailable_without_model",
+    "description": "fallback tool unavailable and model fallback not allowed",
+    "tool_results": {
+      "primary_tool": [{"success": false, "message": "primary failed", "code": "tool_execution_failed"}]
+    },
+    "plan": {
+      "goal": "fallback unavailable",
+      "steps": [
+        {"id": "step_1", "description": "Run primary.", "step_type": "tool", "tool_name": "primary_tool", "args": {"query": "topic"}, "fallback_tools": ["missing_tool"], "allow_model_reasoning": false}
+      ]
+    },
+    "operations": [
+      {"type": "dispatch", "action_type": "call_tool", "target": "primary_tool", "step_id": "step_1", "args": {"query": "topic"}},
+      {"type": "dispatch", "action_type": "fallback_to_tool", "target": "missing_tool", "step_id": "step_1", "args": {"step_id": "step_1", "fallback_reason": "primary failed"}},
+      {"type": "set_step_status", "step_id": "step_1", "status": "failed"},
+      {"type": "build_result", "status": "failed", "success": false}
+    ],
+    "expect": {
+      "status": "failed",
+      "success": false,
+      "latest_observation_code": "fallback_tool_not_available",
+      "fallback_used_count": 0,
+      "tool_call_count": 1,
+      "output_contains": ["Fallback tool is not available", "Failed:"]
+    }
+  },
+  {
+    "id": "safety_outside_workspace_execute",
+    "description": "plan safety precheck blocks outside workspace write",
+    "plan": {
+      "goal": "unsafe write",
+      "steps": [
+        {"id": "step_1", "description": "Write.", "step_type": "tool", "tool_name": "file_writer", "args": {"file_path": "H:\\outside.txt", "content": "data"}}
+      ]
+    },
+    "operations": [{"type": "execute"}],
+    "expect": {
+      "status": "blocked",
+      "success": false,
+      "error_code": "safety_blocked",
+      "failed_step_id": "step_1",
+      "tool_call_count": 0,
+      "output_contains": ["outside workspace", "Blocked:"],
+      "log_record_types_include": ["execution_started", "safety_decision", "execution_finished"]
+    }
+  }
+]

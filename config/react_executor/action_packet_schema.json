@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ReActExecutor ActionPacket",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["action_type"],
+  "properties": {
+    "packet_id": {"type": "string"},
+    "execution_id": {"type": "string"},
+    "plan_id": {"type": "string"},
+    "task_id": {"type": ["string", "null"]},
+    "step_id": {"type": ["string", "null"]},
+    "thought_summary": {"type": "string"},
+    "user_visible_message": {"type": "string"},
+    "action_type": {
+      "type": "string",
+      "enum": [
+        "call_tool",
+        "call_model",
+        "ask_user",
+        "retry_step",
+        "fallback_to_model",
+        "fallback_to_tool",
+        "skip_step",
+        "finish",
+        "fail",
+        "request_replan",
+        "blocked",
+        "cancel"
+      ]
+    },
+    "action_target": {"type": ["string", "null"]},
+    "action_args": {"type": "object"},
+    "expected_observation": {"type": "string"},
+    "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+    "requires_confirmation": {"type": "boolean"},
+    "confirmation_type": {
+      "type": ["string", "null"],
+      "enum": ["missing_info", "confirmation", "choice", "permission", "clarification", null]
+    },
+    "safety_notes": {"type": "array", "items": {"type": "string"}},
+    "fallback_plan": {"type": "object"},
+    "request_replan_reason": {"type": ["string", "null"]},
+    "final_answer": {"type": ["string", "null"]}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"action_type": {"const": "call_tool"}}},
+      "then": {"required": ["action_target", "action_args"]}
+    },
+    {
+      "if": {"properties": {"action_type": {"const": "ask_user"}}},
+      "then": {
+        "properties": {
+          "action_args": {
+            "type": "object",
+            "required": ["ask_type"],
+            "properties": {
+              "ask_type": {
+                "type": "string",
+                "enum": ["missing_info", "confirmation", "choice", "permission", "clarification"]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"action_type": {"const": "finish"}}},
+      "then": {"required": ["final_answer"]}
+    },
+    {
+      "if": {"properties": {"action_type": {"const": "request_replan"}}},
+      "then": {"required": ["request_replan_reason"]}
+    }
+  ]
+}

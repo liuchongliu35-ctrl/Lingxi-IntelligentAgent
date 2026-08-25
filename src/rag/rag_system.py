@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, List
 
+from src.models.compat import require_model_content
 
 class RAGSystem:
     """Minimal retrieval wrapper. Full chunking/ranking can attach here later."""
@@ -30,4 +31,5 @@ class RAGSystem:
             f"检索上下文:\n{retrieved_context}\n\n"
             f"问题: {query}"
         )
-        return model_manager.generate(prompt)
+        response = require_model_content(model_manager.generate(prompt))
+        return response if isinstance(response, str) else str(response)

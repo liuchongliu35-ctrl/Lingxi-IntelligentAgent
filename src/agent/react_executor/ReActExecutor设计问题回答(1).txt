@@ -1,0 +1,1165 @@
+# ReActExecutor 设计问题回答（1）
+
+本文档用于第一轮确认 ReActExecutor 层设计问题。请直接在每个“你的回答：”后面填写答案。
+
+说明：
+- 这些问题不是考试题，目的是把 ReActExecutor V1 的边界、状态机、执行循环和开发步骤定清楚。
+- ReActExecutor 必须和当前已经完成的 Analyzer V1、Planner V1 配合，不能重新承担 Analyzer 的自然语言理解职责，也不能破坏 Planner 已定义的 `TaskPlan -> TaskUnit -> PlanStep` 协议。
+- 如果你不确定，可以写“按你的建议来”，我会按任务型 Agent 的常见工程做法给出保守方案。
+- 有些问题后面写了“为什么要问”，方便你理解这个问题会影响哪部分设计。
+- 如果本轮回答后仍有不明确的点，后续会继续生成 `ReActExecutor设计问题回答(2).txt`、`ReActExecutor设计问题回答(3).txt` 等。
+
+重要概念修正：
+
+标准 ReAct 的核心循环是：
+
+```text
+Thought -> Action -> Observation -> Thought -> ...
+```
+
+本文档里之前写的：
+
+```text
+Reasoning -> Decision -> Tool/Model -> Observation -> Checker
+```
+
+不是要替代标准 ReAct，而是把标准 ReAct 做工程化拆分：
+
+```text
+Thought    ~= Reasoning
+Action     ~= Decision + Tool/Model
+Observation = Observation
+Checker    = 工程增强节点，原始 ReAct 论文中没有
+```
+
+也就是说，ReActExecutor 不是固定顺序执行器，而是“Planner 引导的 ReAct 执行循环”。Planner 给的是初始计划和边界，ReActExecutor 在执行时根据 Observation 继续推理、选择动作、检查结果；如果发现 Planner 的后续步骤不合适，可以做局部调整、fallback，或发出重规划请求。
+
+---
+
+## 1. ReActExecutor 在整个 Agent 中的定位
+
+### 问题 1：你是否同意 ReActExecutor 只负责“执行计划”，不重新做 Analyzer 和 Planner 的职责？
+
+通俗解释：
+Analyzer 已经负责理解用户意图、参数、风险和复杂度；Planner 已经负责生成 `TaskPlan / TaskUnit / PlanStep`。ReActExecutor 不应该重新识别用户意图，也不应该重新生成完整初始计划。
+
+建议：
+ReActExecutor V1 消费 Planner 的结构化计划，负责执行过程中的 Plan-guided ReAct 循环：
+
+```text
+Thought/Reasoning
+  -> Action Selection/Decision
+  -> Action Execution/Tool or Model
+  -> Observation
+  -> Checker
+  -> next Thought/Reasoning
+```
+
+其中 Planner 的 `TaskPlan / TaskUnit / PlanStep` 是执行参考、约束和初始路线，不是死板脚本。
+
+为什么要问：
+这决定 ReActExecutor 是第三层执行引擎，还是会变成第二个 Planner。
+
+你的回答：是的，这一层消费Planner层的结果，然后执行任务完成用户的需求
+
+
+### 问题 2：ReActExecutor 是否替换当前 `Executor`，还是先并行新增一个 `ReActExecutor` 类？
+
+通俗解释：
+当前 `src/agent/executor.py` 里已有顺序执行器。现在可以直接改它，也可以新增 `react_executor.py`，等稳定后再切换主链路。
+
+建议：
+V1 先新增 `ReActExecutor`，保持旧 `Executor` 可用。等 ReActExecutor 测试稳定后，再让 `ReactAgent` 默认使用它。
+
+为什么要问：
+这影响改动风险和回归测试范围。
+
+你的回答：反正原来的顺序执行器Executor在后续正常跑的时候不会使用到所以删掉算了，完全使用ReActExecutor的react机制，既然确定了新的混合架构就不需要之前的顺序执行的架构了，简化开发复杂度嘛，后续没用的代码不需要
+
+
+### 问题 3：ReActExecutor V1 的目标应该是哪一种 ReAct 执行粒度？
+
+选项：
+
+```text
+A. 顺序执行增强：基本按 PlanStep 执行，只加 Observation、Checker、重试、日志
+B. Plan-guided Step ReAct：以 PlanStep 为参考，每一步执行前后都由 LLM 推理和决策
+C. TaskUnit ReAct：在一个 TaskUnit 内允许多轮 Thought/Action/Observation，并可局部调整后续步骤
+D. 全局 ReAct：整个 TaskPlan 只作为参考，执行器完全动态决定下一步
+```
+
+建议：
+V1 建议做 B，并吸收一部分 C 的能力：
+
+```text
+以 Planner 的 PlanStep 为主线
+每个执行循环都调用 LLM Reasoning
+允许在当前 TaskUnit 内做局部调整、重试、fallback
+如果需要大范围改计划，则输出 request_replan，不在 V1 自动重写整个 TaskPlan
+```
+
+为什么要问：
+这决定第一版是“死板按计划跑”，还是“按计划引导、执行时智能调整”。Planner 层已经给出了结构化初始计划，但 ReActExecutor 应该能根据 Observation 修正具体执行动作。
+
+你的回答：按你的建议来，Planner动态重规划是后续V2做的
+
+
+---
+
+## 2. ReAct 循环粒度与状态机
+
+### 问题 4：每个 PlanStep 是否都需要经过 Reasoning 节点？
+
+通俗解释：
+即使 Planner 已经给了步骤，执行前是否还要让 ReActExecutor 判断：
+
+```text
+这个步骤现在能不能执行？
+依赖输入是否齐全？
+是否需要确认？
+应该调用工具还是模型？
+```
+
+建议：
+需要。结合你的回答，V1 应该默认调用 LLM 做 Reasoning，但在调用 LLM 前仍需要先做确定性的工程检查：
+
+```text
+plan.can_execute 是否允许
+依赖输入是否存在
+是否命中危险动作
+是否需要确认
+是否超过最大循环次数
+```
+
+这些确定性检查不是替代 Thought，而是安全护栏。通过检查后，再让 LLM 基于 Planner 当前步骤、已有 Observation 和历史上下文进行 Thought/Reasoning。
+
+为什么要问：
+这决定 ReActExecutor 的“Reasoning”是工程状态判断，还是每步都消耗模型 token。
+
+你的回答：需要，V1就设计为调用LLM吧，毕竟主要还是靠模型这个大脑来指挥和判断灵活处理的，万一规则不行那就完了
+毕竟Reasoning也是react架构的一个步骤，
+Thought（推理） -> Action（行动） -> Observation（观察）。这是react架构的标准流程
+我的执行器ReActExecutor流程中：
+Reasoning 对应 Thought。
+Decision + Tool 共同对应 Action（Decision负责判断“是调用工具还是结束”，Tool负责执行具体动作）。
+Observation 完全对应。
+Checker 在原始论文中不存在，属于工程增强。
+所以既然Reasoning 是推理这个步骤所以是比较重要的，是在处理一个任务的时候比如说到了第2步了，那么Reasoning 就需要知道第一步的结果然后让模型这个大脑根据已有情况判断下一步的Decision + Tool这个是什么样的，比如该做什么样的判断，第二步该调用什么工具，第一步已经完成到什么程度了第二步需要完成什么等等都需要这一步调用大模型大脑进行推理这样的agent才有意义，才是真正的agent自动规划实现步骤自动检测自动调整
+在完成一个任务的时候大致流程如下：
+Reasoning（分析现状）
+→ Decision（判断：需要查资料）
+→ Tool（执行查资料，得到原始结果）
+→ Observation（将原始结果转译为自然语言状态）
+→ Checker（检查：步数未超限，上下文未满，继续）
+→ （回到 Reasoning）
+...
+→ 直到 Decision 输出“结束”
+→ Checker（检查通过）
+→ 输出最终答案。
+其实这里显得Planner层做的步骤规划就有点死了，毕竟执行器需要根据实际的上一步执行情况来调整后面的步骤规划，所以Planner层就算是当做一个参考吧，先按照Planner层的规划跑，在推理时发现Planner层规划不对就做及时的调整吧，目前只能这样了
+
+
+### 问题 5：Decision Branch 需要支持哪些 Action 类型？
+
+建议 V1 支持：
+
+```text
+call_tool
+call_model
+ask_user
+skip_step
+retry_step
+fallback_to_model
+fallback_to_tool
+request_replan
+stop_success
+stop_failed
+blocked
+```
+
+通俗解释：
+执行器每一轮 Thought 后都要选择一个 Action。`Decision + Tool/Model` 合起来才是标准 ReAct 里的 Action。
+
+建议：
+Action 类型先固定为枚举，LLM 必须从枚举里选择。不要让 LLM 在运行时自由发明新的 Action 类型；如果模型认为枚举不够，可以输出：
+
+```text
+request_replan
+```
+
+或在日志里记录 `unsupported_action_suggestion`，后续人工评估是否扩展枚举。
+
+你的回答：这里的决策类型是固定死的吗，如果是的那就先固定死吧，到Reasoning节点进行推理的时候带这些固定死的，这样大模型就可以从这里面选择一个，如果这些固定死的不够，那就让大模型新增，灵活的去做
+那你在开发的时候就尽量把所有的情况就是一般的agent处理任务时可能的判断全部枚举出来吧，目前只能这样了，你建议里面的那几个可能都不够，后续设计开发的时候尽量多考虑一些吧
+
+
+### 问题 6：ReActExecutor 是否需要显式维护执行状态枚举？
+
+建议状态：
+
+```text
+pending
+running
+waiting_user
+completed
+failed
+skipped
+blocked
+cancelled
+```
+
+通俗解释：
+`TaskUnit`、`PlanStep` 和整个执行结果都需要状态，否则后续日志、UI 和断点续跑都很难做。
+
+你的回答：需要
+
+
+### 问题 7：V1 是否需要支持暂停后继续执行？
+
+例子：
+
+```text
+执行到 delete_file，需要用户确认
+执行器暂停
+用户回复“确认”
+执行器从原步骤继续
+```
+
+建议：
+V1 可以先不做完整断点续跑，但需要预留 `waiting_user` 状态和 `pending_confirmation` 记录。真正多轮恢复放到 V2。
+
+为什么要问：
+这影响确认机制、会话状态保存和 ReactAgent 主链路。
+
+你的回答：这个应该需要吧，而且你举的例子不妥当那个吧，这里确认是否删除和断点继续执行有什么关系呢，这里确认流程不是代码层面上停止流程吗，if判断是否确认后继续后续的流程不是吗，这不涉及断点啊，这里用户确认后根据用户选择继续后续的流程不涉及断点重续吧，什么是断点呢，断点是agent正常跑的时候（没有任何需要用户确认的提示）手动点击了停止，导致对话停止，这个断点续跑一般的agent没办法实现吧，就我使用的trae和codex都没有这个功能，点击停止后就没有办法在后续继续上一个对话没有完成的，不过在后续的对话中如果提到了继续上一个对话没有完成的大模型确实可以识别出上一个对话完成到哪里了，这个应该需要做，所以还是需要记录一下每一个对话完成的进度的，方便如果误触暂停了，下一个对话还是可以根据上一个对话（或者前面对话）判断出任务已经实现到哪里了，也知道后面还有哪些没有实现
+
+
+---
+
+## 3. TaskPlan / TaskUnit / PlanStep 的消费方式
+这三个概念的理解：
+TaskPlan
+  = 一次用户请求对应的整体执行计划
+
+TaskUnit
+  = TaskPlan 里的一个子任务单元
+  = 可能对应一个 intent，也可能由多个强依赖 intent 合成
+
+PlanStep
+  = TaskUnit 里的具体执行步骤
+  = 真正给 ReActExecutor 执行时消费的最小计划单位
+  
+### 问题 8：ReActExecutor 是否严格按 `task_units` 顺序执行？
+
+通俗解释：
+Planner 已经把任务分成多个 TaskUnit。V1 是严格按顺序执行，还是允许 ReActExecutor 根据 Observation 做局部调整？
+
+建议：
+V1 默认按 `task_units` 顺序执行，但不是死板执行：
+
+```text
+1. TaskUnit 外层顺序默认遵守 Planner。
+2. TaskUnit 内部可以根据 depends_on/input_from 和 Observation 做局部调整。
+3. 如果 LLM Reasoning 判断当前 TaskUnit 顺序明显不合理，可以跳过、重试、fallback，或输出 request_replan。
+4. V1 不做跨 TaskUnit 并行，也不自动重写整个 TaskPlan。
+```
+
+为什么要问：
+这可以同时保留 Planner 的结构化控制，又让 ReActExecutor 具备真正的 ReAct 执行灵活性。
+
+你的回答：按你的建议来
+
+
+### 问题 9：ReActExecutor 执行步骤时以 `plan.steps` 扁平列表为主，还是以 `task_units.step_ids` 为主？
+
+通俗解释：
+Planner 同时保留了 `task_units` 和扁平 `steps`。执行器需要明确以哪个为执行入口。
+
+建议：
+以 `task_units` 为外层顺序，每个 TaskUnit 通过 `step_ids` 找到对应 `PlanStep`；如果缺少 `task_units`，再兼容 `plan.steps` 扁平顺序。
+
+为什么要问：
+这决定 ReActExecutor 是否真正消费 Planner 的三层结构。
+
+你的回答：按你的建议来
+
+
+### 问题 10：如果 `depends_on` 指向的前置步骤失败，当前步骤是否默认跳过？
+
+建议：
+默认跳过并标记 `skipped`，最终结果说明跳过原因。只有 `on_failure=skip_optional` 或步骤标记可选时，才允许继续后续无依赖步骤。
+
+你的回答：这个不懂是哪个结构里面的字段，请在下一个问题询问文档中重新询问并详细讲一下
+
+
+### 问题 11：如果 `input_from` 引用不存在，应该视为计划错误还是执行错误？
+
+建议：
+视为执行前校验错误，当前步骤不执行，并返回结构化失败。因为 Planner 已经做过计划校验，如果运行时仍出现，说明计划或状态被破坏。
+
+你的回答：采取你的建议，就是在之前有需要校验一下，如果校验发现某个字段是空的或者值不对并会影响后续的执行那就需要返回结构化失败提示，不过这种错误后续V2应该做防范尽量做到出现这种情况的概率为0
+
+
+---
+
+## 4. Observation Store 与中间结果
+
+### 问题 12：ReActExecutor 是否需要独立的 Observation Store？
+
+通俗解释：
+当前旧 Executor 用 `step_context` 保存结果。ReActExecutor 是否要把它升级成正式对象，记录每一步工具调用、模型调用、失败、重试和耗时？
+
+建议：
+需要。V1 建议新增 `Observation` 和 `ObservationStore`。
+
+你的回答：需要，就是说Observation Store这个记录下模型根据这一步的执行情况观察得到的结果是吗
+
+
+### 问题 13：Observation 至少需要保存哪些字段？
+
+建议字段：
+
+```text
+observation_id
+plan_id
+task_id
+step_id
+attempt
+action_type
+tool_name
+input_args
+success
+data
+message
+error
+code
+started_at
+finished_at
+duration_ms
+```
+
+通俗解释：
+这些字段能支撑日志、调试、Checker 判断和后续 UI 展示。
+
+你的回答：保留你建议的这些字段，同时在设计开发的时候尽量进行补充和边界情况界定
+
+
+### 问题 14：工具输入参数和工具输出是否都要完整写入 Observation？
+
+背景：
+完整记录方便排查问题，但可能包含隐私、密钥、文件内容等敏感信息。
+
+建议：
+V1 记录结构化输入输出，但预留脱敏函数；对明显敏感字段如 `api_key/token/password/secret` 做基础脱敏。
+
+你的回答：采取你的建议
+
+
+### 问题 15：中间结果是否只保存在内存，还是同时落盘？
+
+建议：
+V1 先保存在内存，并把摘要写入日志；完整持久化 Observation Store 放到 V2。
+
+为什么要问：
+这影响复杂度和数据目录设计。
+
+你的回答：V1先存内存
+
+
+---
+
+## 5. Tool Node 与工具调用
+
+### 问题 16：ReActExecutor 调用工具时是否必须统一通过 `ToolManager.run_tool()`？
+
+建议：
+V1 是。ReActExecutor 不直接调用具体工具类，统一走 `ToolManager` 或未来 `ToolRegistry`。
+
+为什么要问：
+这保持工具层边界清晰，也方便后续统一 schema、安全和日志。
+
+你的回答：采取你的建议，就是工具层统一对外提供接口，ReActExecutor调用工具接口，传指定参数即可，这样也是工程化保持边界清晰的需求
+
+
+### 问题 17：工具调用前是否需要再次做安全检查？
+
+通俗解释：
+Analyzer 和 Planner 已经做了风险判断，但执行器是最后一道防线。执行前是否还要检查：
+
+```text
+是否写工作区外文件
+是否删除文件
+是否执行代码
+是否调用 shell
+是否访问敏感路径
+```
+
+建议：
+必须做。Analyzer/Planner 是前置判断，ReActExecutor 是执行前拦截。
+
+你的回答：需要，这种工程化的安全措施是必须的
+
+
+### 问题 18：如果工具返回 `ToolResult.success=False`，ReActExecutor 是否应该先按 `ToolResult.code` 分类处理？
+
+建议：
+是。比如：
+
+```text
+missing_config -> ask_user 或 fallback
+missing_argument -> failed 或 ask_user
+permission_denied -> blocked
+timeout -> retry
+tool_not_found -> fallback_to_model 或 missing_tools
+```
+
+为什么要问：
+这决定失败处理是结构化决策，还是简单返回错误文本。
+
+你的回答：采取你的建议
+
+
+### 问题 19：工具参数是否只使用 Planner 已装配好的 `step.args`，还是 ReActExecutor 可以补参数？
+
+建议：
+ReActExecutor 可以做运行时参数注入，例如把 `input_from` 的 Observation 输出注入到 `text/content`，但不重新理解用户意图来发明关键参数。
+
+你的回答：采取你的建议，就是调用工具需要传入的参数一般都是固定的那几个，只不过那几个参数的具体值是在ReActExecutor运行时得到的这样就动态注入，发明新入参明显是不行的，其实后续添加工具mcp时应该一般的mcp工具都是约定好入参的，所以只需要将新加入的mcp需要的入参列表导入到内部即，让大模型知道这个工具需要的入参，不过应该需要运行时导入的参数一般比较少，一般的参数使用默认的即可了，就比如那5个基础工具基本入参都是确定的，也就只有2到3个参数是需要动态传的，这个是不是需要做一个协议，就是每一个工具需要的入参整个系统是知道的，这部分是固定流程化的，写死的
+
+
+### 问题 20：如果工具参数仍缺失，ReActExecutor 应该询问用户还是直接失败？
+
+建议：
+如果缺的是用户必须提供的信息，进入 `ask_user`；如果缺的是 Planner 应该生成的内部参数，标记计划错误并失败。
+
+你的回答：我觉得工具调用时需要的入参应该固定好，就那几个字段整个系统都是知道的，最后可能会出现问题的就是上游给不了这个工具需要的这个参数，就是说这个参数值为空，这样的话还是跳过正常进行下一步吧，但是在给用户的反馈文字中需要标明这一步可能是失败的，如果不影响完成后续的任务和步骤那么后续的步骤和任务最好还是正常行去完成
+
+
+---
+
+## 6. Model Node 与模型调用
+
+### 问题 21：`step_type=model/respond` 是否统一调用 `ModelManager.generate()`？
+
+建议：
+V1 是。后续再扩展流式输出、多模型路由、结构化响应。
+
+你的回答：V1就做流式输出吧，最好用户可以看到流式的思考内容以及每一步骤的完成情况，不过调用模型时可以显示思考，用户界面点击思考就可以看到模型输流式输出内容或者，然后具体调用工具或者命令行执行时的日志用户界面也可以点击展开看到工具调用日志和调用运行结果就和codex这样
+
+
+### 问题 22：模型调用 prompt 是否需要包含 Analyzer、Planner 和 Observation 上下文？
+
+建议：
+需要，但要控制长度。V1 prompt 至少包含：
+
+```text
+用户输入
+Analyzer 摘要
+当前 TaskPlan/PlanStep
+前置 Observation 摘要
+历史对话摘要
+风险提示
+```
+
+为什么要问：
+这决定模型步骤能不能利用前面工具结果，而不是孤立回答。
+
+你的回答：需要，这样模型在执行各个步骤以及调整后续完成计划时可以有依据，知道前面做了什么处理，还有模型的输出也需要严格的结构化不然都解析不出来模型大脑的指挥指令，模型的指挥指令最好做结构化输出，同时需要严格要求模型按照结构化输出，做结构化校验，不对就进行重试（至少重试5次吧）
+
+
+### 问题 23：模型是否可以在执行阶段调整 Planner 的后续步骤？
+
+选项：
+
+```text
+A. V1 不允许，只能严格按 PlanStep 执行
+B. 允许模型做当前 TaskUnit 内的局部调整，例如跳过、重试、fallback、调整下一步动作
+C. 允许模型建议大范围重规划，但只输出 request_replan，不自动改写整个 TaskPlan
+D. 允许模型动态生成新步骤并直接执行
+```
+
+建议：
+V1 建议采用 B + C：
+
+```text
+允许局部执行调整
+允许 request_replan
+不允许模型自由生成一串新步骤并直接执行
+```
+
+为什么要问：
+这能解决“Planner 计划太死”的问题，同时避免 ReActExecutor 变成无约束自动执行器。
+
+你的回答：采取你的建议，但是如果检测到按照局部调整计划执行后任然最后明显是走不通的那就最后交给LLM兜底重新规划（也就是换一个思路和步骤去解决问题不要一直按照老的明显走不到正确结果的步骤走，至于这个判断是否走不通可以让大模型进行自检和后续可行性的检测，如果大脑认为后续调整后的规划依可行性低那就换方案调整步骤重新跑）这几也是我使用trae是遇到过的问题就是明明这个修改代码的思路不对还是一直往错误的方向修改，这时我觉得应该自动的换思路和新的步骤规划来解决
+
+
+### 问题 24：模型生成命令行 fallback 时，是否允许直接执行？
+
+背景：
+Planner 设计中提到工具失败后可以考虑命令行兜底，但命令必须由模型生成并经过安全校验。
+
+建议：
+V1 不直接执行模型生成的命令，除非后续有受控 `ShellTool/CommandTool` 并通过安全策略。当前可以生成“候选命令方案”，但不自动运行。
+
+为什么要问：
+这是高风险边界，必须先明确。
+
+你的回答：这个命令可以提示给用户，就像codex这样在运行某一个命令行命令时会提示用户是否执行，用户可以选择once，就这次对话可以执行，也可以选择solo本次对话后续的命令都默认可以执行
+
+
+---
+
+## 7. Checker 节点与完成判断
+
+### 问题 25：每轮 Action/Observation 后是否都需要 Checker 判断？
+
+建议：
+需要。Checker 是工程增强节点，不属于原始 ReAct 的必要定义，但对工程化 Agent 很重要。它判断：
+
+```text
+是否成功
+输出是否为空
+是否满足 expected_output
+是否需要重试
+是否需要 fallback
+是否需要询问用户
+是否可以进入下一步
+是否需要 request_replan
+是否达到终止条件
+```
+
+通俗解释：
+原始 ReAct 可以让模型自己根据 Observation 继续 Thought，但工程实现里需要 Checker 兜底判断，防止无限循环、误执行、空结果继续传递。
+
+你的回答：需要，采取你的建议
+
+
+### 问题 26：Checker V1 主要使用规则判断，还是调用 LLM 判断？
+
+建议：
+V1 建议采用“规则底线 + LLM 辅助”：
+
+```text
+规则 Checker 负责硬约束：
+  超时、失败码、空输出、最大循环次数、安全策略、依赖缺失
+
+LLM Checker 负责语义判断：
+  当前 Observation 是否满足 step.expected_output
+  是否需要继续查找信息
+  是否应该 fallback
+  是否需要 request_replan
+```
+
+为什么要问：
+LLM Checker 灵活但不稳定，规则 Checker 可测试。两者结合更适合你的“模型作为大脑，但工程可控”的目标。
+
+你的回答：采取你的建议
+
+
+### 问题 27：Checker 是否需要验证文件写入、文件修改、命令执行这类副作用？
+
+例子：
+
+```text
+file_writer 返回成功后，是否检查文件真的存在？
+未来 shell command 返回成功后，是否检查目标结果？
+```
+
+建议：
+需要，但 V1 先支持基础验证。复杂验证放到专门 Preview/Check 工具。
+
+你的回答：你的意思是需要Checker我去验证是否执行成功是吗，比如文件写入后去验证是否写入成功是吗，如果是这个意思那我觉得可以做
+
+
+### 问题 28：最终回答是否由 ReActExecutor 直接生成，还是交给 Responder？
+
+当前项目还没有独立 Responder。旧 Executor 直接返回最后一步结果。
+
+建议：
+V1 由 ReActExecutor 生成最终 `ExecutionResult.output`；后续再拆出 Responder。
+
+你的回答：我希望的用户看到的工作模式是：想coedx一样一边流式输出文字描述（可以是思考的过程或者下一步的计划打算）文字描述结束后就执行具体的任务，调用工具编辑，修改，执行命令等等，就比如：
+我会在现有问题文件里直接做一次“概念校准”修改，保留你已经写的回答，不覆盖你的内容。重点改前面容易误导的几个问题和说明，把它从“固定顺序执行器增强”调整成“Planner 引导的 ReAct 执行循环”。
+
+Edited ReActExecutor设计问题回答(1).txt+71-13（这个就是具体执行某个动作的日志描述点击后就可以看到具体修改了哪些东西编辑的内容等，如果这是一个命令行执行提示点击后就可以看到执行了那个点命令以及执行结果）
+
+前 5 个问题已经改成“标准 ReAct + 工程增强”的表述了。这个改动也会影响后面关于 TaskUnit 顺序、模型能否调整计划、Checker 的问题，我继续把这些相关问题一并校准，避免你后面继续填写时被旧措辞带偏。
+大概就像上面这样的交互方式，最后所有任务都完成后就输出最终的描述文本（比如，描述任务完成状况，完成了哪些任务，方法是什么，结果是什么等等总结性的文本还附带回答用户的某些需要文字描述的问题）
+所以你问的这个问题我不是太了解，反正我希望的交互方式和执行过程(任务完成过程)、执行结果、最终回答就大概需要像这样的模式
+
+---
+
+## 8. 失败处理、重试与 fallback
+
+### 问题 29：每个步骤默认最大重试次数是否使用 Planner 的 `step.max_retries`？
+
+建议：
+是。Planner 只声明 `retryable/max_retries`，ReActExecutor 才真正执行重试。
+
+你的回答：采取你的建议
+
+
+### 问题 30：哪些失败类型允许重试？
+
+建议允许：
+
+```text
+timeout
+temporary_network_error
+rate_limited
+model_call_failed
+tool_transient_error
+```
+
+不建议重试：
+
+```text
+permission_denied
+blocked_by_policy
+missing_required_argument
+file_not_found
+dangerous_operation
+```
+
+你的回答：采取你的建议，反正那种实在是完成流程不可或缺的东西缺失（文件，工具等）就可以不需要重试，这种明显是需要外部操作的就不需要重试，但是如果大模型可以解决的那就重试，还有即使决定了不重试且后续步骤执行不下去只能直接结束的时候还是需要调用模型让模大致了解问题和原因后将总结性的回答反馈给用户。这样用户就知道为什么任务没有成功，反正就是即使失败了也需要使用文字描述给一个详细的交代
+
+
+### 问题 31：重试间隔是否需要退避策略？
+
+建议：
+V1 使用简单固定间隔或立即重试即可；指数退避放到 V2。
+
+你的回答：V1就使用指数退避吧
+
+
+### 问题 32：`on_failure` 需要支持哪些处理方式？
+
+Planner 已预留 `on_failure`。
+
+建议 V1 支持：
+
+```text
+stop
+retry
+fallback_to_model
+fallback_to_tool
+ask_user
+skip_optional
+fail
+```
+
+你的回答：采取你的建议，fallback_to_tool= 原工具失败后，改用备用工具完成，这个备用工具还是使用命令行这个来当做备用工具吧，因为调用工具的底层还是命令行，所以命令行才是agent的最终解决方案，所以这里还需要让大模型了解后换用命令行的解决方式和步骤来解决
+
+
+### 问题 33：fallback_to_model 的输出是否可以替代工具输出继续传给后续步骤？
+
+例子：
+
+```text
+search_tool 失败 -> 模型基于已有知识给出总结 -> 后续 write_file 写入该总结
+```
+
+建议：
+可以，但 Observation 必须标记 `fallback_used=True` 和 `fallback_type=model`，最终回答也要说明结果可能不如工具检索可靠。
+
+你的回答：采取你的建议
+
+
+### 问题 34：fallback_to_tool 是否只允许使用 Planner 声明的 `fallback_tools`？
+
+建议：
+V1 是。ReActExecutor 不应自己发明新工具名；如果未来接 ToolRegistry，可以基于 registry 查找安全 fallback。
+
+你的回答：采取你的建议，反正的工具肯定是本地配置过的mcp工具，如果查找不到大模型指定的那个工具那就换命令行的解决方案吧，一般uv和nodejs包里面应该是有大部分工具的mcp的，可以去调用，实在不行就使用powershell去做，比如调用编辑工具失败或者python跑脚本失败那就直接使用等效的命令行命令去解决
+
+
+---
+
+## 9. 确认、安全与高风险动作
+
+### 问题 35：ReActExecutor 是否必须尊重 Planner 的 `can_execute=False`？
+
+建议：
+必须。只要 `plan.can_execute=False` 或 `plan_validation_status=invalid`，ReActExecutor 不能执行真实工具步骤。
+
+你的回答：采取你的建议
+
+
+### 问题 36：如果某个 PlanStep 标记 `requires_confirmation=True`，ReActExecutor 是否在执行到该步骤时暂停？
+
+建议：
+是。V1 返回确认提示并把状态标记为 `waiting_user`，不执行该步骤。
+
+为什么要问：
+你在 Planner 问答中提到删除文件最好由 Executor 执行到该步时拦截确认，这里需要正式定义。
+
+你的回答：采取你的建议
+
+
+### 问题 37：删除文件、执行代码、shell 命令是否都必须走步骤级确认？
+
+建议：
+是。即使 Analyzer/Planner 漏掉，ReActExecutor 执行前也必须拦截。
+
+你的回答：采取你的建议
+
+
+### 问题 38：写文件是否默认允许执行？
+
+背景：
+Planner 问答中你接受 V1 写入可以默认 solo，但删除和执行代码需要确认。
+
+建议：
+V1 允许工作区内普通写文件；覆盖文件、工作区外路径、敏感路径仍需要确认或 block。
+
+你的回答：是，默认允许执行写文件，但是用户如果明确要求了哪些文件不能直接编辑的话就只将需要写到这个文件的内容通过文本的形式输出然后告诉用户在哪里修改
+
+
+### 问题 39：ReActExecutor 是否应该禁止任何工作区外文件修改？
+
+建议：
+V1 禁止工作区外写入、删除、移动、重命名。读取工作区外文件也应谨慎，至少需要明确用户提供路径且不能是敏感系统路径。
+
+你的回答：工作父级目录外的文件只给读取的权限
+
+
+---
+
+## 10. 命令行 / Shell fallback
+
+### 问题 40：ReActExecutor V1 是否实现真实 ShellTool？
+
+背景：
+Planner 设计里多次提到工具失败后可以考虑命令行兜底，但这需要很强的安全边界。
+
+选项：
+
+```text
+A. V1 不实现真实 shell，只预留字段
+B. V1 实现只读/低风险命令，例如 ls、dir、python -m unittest
+C. V1 实现受控 shell，支持白名单、工作区限制、超时和确认
+```
+
+建议：
+如果当前目标是先做 ReActExecutor 主循环，V1 选 A 或 B；完整受控 shell 放到后续 Tools 层专项开发。
+
+你的回答：需要实现命令行工具，可以执行大模型给出的命令，对个命令按步骤执行，然后执行每一个命令前问一下用户获取确认，当然命令行执行工具到tool层在开发，我的意思是说V1需要做命令行工具可以执行命令
+
+
+
+### 问题 41：如果未来执行 shell，命令来源应该是谁？
+
+选项：
+
+```text
+A. Planner 直接给命令
+B. ReActExecutor 根据上下文调用模型生成命令
+C. 专门 CommandPlanner/CommandTool 生成并校验命令
+```
+
+建议：
+V1 不直接运行模型自由生成的命令；未来应由专门 CommandTool 做校验。
+
+你的回答：大模型给的，在Planner如果就决定了需要使用命令行来解决的话肯定就按照Planner规划好的命令执行步骤来走（一般是Planner的大模型就知道目前没有工具可以实现这个任务或者用户输入里面指定的mcp工具根本就没有这里大模型应该就可以换命令行的解决方案，至于后续调用工具时才发现mcp使用不了的那就让大模型到观察结果的阶段发现后再做调整换命令行方案继续解决）
+
+
+### 问题 42：命令执行前需要哪些安全检查？
+
+建议至少包括：
+
+```text
+工作区限制
+危险命令关键词
+删除/覆盖/权限修改检测
+网络安装类命令检测
+超时限制
+输出长度限制
+确认策略
+```
+
+你的回答：采取你的建议，在设计的时候请多添加一些，尽量可以应对更多的情况，确认边界
+
+
+---
+
+## 11. 日志、追踪与调试
+
+### 问题 43：ReActExecutor 是否需要单独日志文件？
+
+建议：
+需要，位置：
+
+```text
+logs/react_executor.log
+```
+
+记录：
+
+```text
+plan_id
+source_trace_id
+task_id
+step_id
+decision
+tool_name
+attempt
+success
+error/code
+duration_ms
+checker_result
+```
+
+你的回答：需要
+
+
+### 问题 44：是否需要把一次执行生成完整 trace？
+
+通俗解释：
+类似：
+
+```text
+trace_id -> plan_id -> task_1 -> step_1 -> attempt_1 -> observation
+```
+
+建议：
+需要。Analyzer 有 `trace_id`，Planner 有 `plan_id/source_trace_id`，ReActExecutor 应继续串起来。
+
+你的回答：需要，采取你的建议
+
+
+### 问题 45：日志中是否记录完整模型 prompt？
+
+背景：
+完整 prompt 有助于调试，但可能很长，也可能包含隐私。
+
+建议：
+V1 不默认记录完整 prompt，只记录 prompt 摘要、长度、相关 step_id 和模型返回摘要。开发模式可配置开启完整 prompt 日志。
+
+你的回答：不需要记录完整的，不然太多了，只记录才摘要和一些基本日志信息即可，其实模型返回的东西有两种，一种是结构化的东西这种文字不多可以全部记录下来，但是那种思考的文本以及总结性的文本太长就记录摘要即可，还有就是前面提到的那种交互模型里面模型文字回答以及执行过程记录交替出现的那种我不知道内部是如何实现的，这个你帮我设计实现，反正这个应该可以通过模型结构化输出来解决，描述文本和具体步骤执行指令和需要写到（修改）文件的文字专门放到一个字段，反正这个数据结构你可以帮我设计一下，将模型返回的东西区分开来，什么是可以直接给用户看的，什么是执行过程，什么是需要提交执行器跑的，大概就是这种意思，因为模型返回什么东西还是需要我们自己去设计数据结构的才可以正常的去正常消费结构化数据，这样模型这个大脑才可以正常指挥agent（本质上大模型就是自然语言大模型，返回的token是自然语言，所以如何将大模型思考的东西给agent消费就需要和大脑规定好各个部分的数据结构，比如Planner的计划规划怎么组织，后续调整方案以及生成命令怎么组织和消费）
+
+
+---
+
+## 12. 返回结果与用户体验
+
+### 问题 46：ExecutionResult 是否需要扩展字段？
+
+当前旧结构大致是：
+
+```python
+success
+output
+steps
+```
+
+建议 ReActExecutor V1 增加：
+
+```text
+execution_id
+plan_id
+status
+observations
+failed_step_id
+error_code
+requires_user_input
+user_input_request
+summary
+```
+
+你的回答：采取你的建议，反正用户体验的效果我前面已经说过了，大概就是那样的呈现方式，具体怎么组织这些数据和呈现文本和执行过程你帮我设计，合理即可
+
+
+### 问题 47：当部分步骤成功、后续步骤失败时，最终回答应该怎么呈现？
+
+建议：
+告诉用户：
+
+```text
+已完成哪些步骤
+失败在哪一步
+失败原因
+是否可以重试或需要用户补充什么
+```
+
+不要只返回最后一个错误。
+
+你的回答：采取你的建议，反正只要不要只给一个简单的回复即可，需要将详细的东西告诉用户，已经做了哪些，没有做哪些，指导用户后续可以如何做来完成后续的东西等等，反正即时部分失败或者全部失败都需要全面一点反馈给用户
+
+
+### 问题 48：成功完成多步骤任务时，最终回答是否需要总结所有关键 Observation？
+
+建议：
+需要。V1 可以由 ReActExecutor 简单汇总；后续交给 Responder 做更自然的最终回答。
+
+你的回答：需要，这个好
+
+
+---
+
+## 13. 测试与验收
+
+### 问题 49：ReActExecutor V1 是否需要 fixture 回归样例？
+
+建议：
+需要。Planner 已有 24 条 fixture，ReActExecutor 应建立 20-40 条执行 fixture，覆盖成功、失败、重试、确认、依赖注入、model fallback。
+
+你的回答：采取你的建议
+
+
+### 问题 50：ReActExecutor V1 优先覆盖哪些测试场景？
+
+建议优先覆盖：
+
+```text
+calculate 单步工具成功
+search -> summarize 多步依赖
+read_file -> extract -> write_file 依赖注入
+tool failure -> retry -> success
+tool failure -> fallback_to_model
+requires_confirmation -> waiting_user
+plan invalid -> 不执行
+missing input_from -> 失败
+model/respond 步骤
+block 策略不执行
+```
+
+你的回答：你的建议可以，但是我觉得不全，可以再拓宽一下，反正只要可以正常的去解决用户的任务中环处理最后可以解决用户的问题即可。需要闭环
+
+
+### 问题 51：是否需要端到端测试覆盖 Analyzer -> Planner -> ReActExecutor？
+
+建议：
+需要，但 V1 可以先少量覆盖 5-10 条主链路。ReActExecutor 单元测试先做扎实。
+
+你的回答：需要，因为这三个基本就是agent的核心东西了，所以需要测试这个链条
+
+
+---
+
+## 14. ReActExecutor V1 开发范围
+
+### 问题 52：你是否认可 ReActExecutor V1 的完成标准？
+
+建议 V1 完成标准：
+
+```text
+1. 能消费 Planner V1 的 TaskPlan / TaskUnit / PlanStep。
+2. 能以 TaskUnit 和 PlanStep 为初始路线执行，但允许当前 TaskUnit 内局部调整。
+3. 能实现标准 ReAct 的 Thought / Action / Observation 循环，并用 Decision、Tool/Model、Checker 做工程化拆分。
+4. 能记录结构化 Observation。
+5. 能处理 input_from / output_key 的中间结果传递。
+6. 能执行普通 tool 步骤和 model/respond 步骤。
+7. 能尊重 can_execute、plan_validation_status、block、clarify、confirm、missing_tools、chat 等策略。
+8. 能执行步骤级重试。
+9. 能支持 fallback_to_model 和基础 fallback_to_tool。
+10. 能在需要确认时暂停，不误执行危险动作。
+11. 能在发现初始计划不适合时输出 request_replan，而不是盲目继续。
+12. 能输出结构化 ExecutionResult。
+13. 有 ReActExecutor 日志。
+14. 有单元测试、fixture 回归和少量端到端测试。
+```
+
+你的回答：这个完成标准等你看过前面的问题回答后再说吧，可以到第二轮问答再说
+
+
+### 问题 53：你是否认可 ReActExecutor V1 暂不做以下能力？
+
+建议 V1 暂不做：
+
+```text
+1. 不做完整自动动态重规划，只输出 request_replan。
+2. 不做跨 TaskUnit 的自由 ReAct 循环。
+3. 不做并行任务执行。
+4. 不做长任务后台调度。
+5. 不做完整确认后断点续跑。
+6. 不做真实高风险 shell 自动执行。
+7. 不做完整 ToolRegistry schema 校验。
+8. 不做复杂 UI 展示。
+```
+
+通俗解释：
+这些不是不重要，而是放到 V2/V3 更稳。V1 先把执行主循环跑稳。
+
+你的回答：这个等你看过前面的问题回答后再说吧，可以到第二轮问答再说
+
+
+---
+
+## 15. 你希望面试时怎么讲 ReActExecutor？
+
+### 问题 54：你更希望 ReActExecutor 被描述成哪种角色？
+
+选项：
+
+```text
+A. 顺序执行器增强版
+B. ReAct 执行引擎
+C. 工具调用调度器
+D. 计划执行和观察检查层
+```
+
+建议：
+可以组合讲：ReActExecutor 是“计划执行和观察检查层”，内部采用 ReAct 执行循环。
+
+你的回答：“计划执行和观察检查层”，内部采用 ReAct 执行循环。这个可以混合架构嘛
+
+
+### 问题 55：你希望 ReActExecutor 的设计重点强调什么？
+
+选项：
+
+```text
+A. 能真正执行多步骤任务
+B. 能记录 Observation 并可追踪
+C. 能安全调用工具
+D. 能失败重试和 fallback
+E. 能和 Planner 解耦
+F. 能为后续动态重规划打基础
+```
+
+建议：
+都可以强调，但 V1 最重要的是 A、B、C、D。
+
+你的回答：ABCD，动态规划我觉得只要这个ReActExecutor观察后思考推理节点可以自动调节后续步骤即可（如果后续步骤不对的情况下）至于后续V2可以上升到Planner动态规划，Planner可以自动重新根据具体执行情况进行规划和调节，这个是上级的，可以和ReActExecutor的调节进行配合，小的可以使用ReActExecutor调节，大层面方向上的调整就需要上升到Planner动态规划了
+
+
+---
+
+## 16. 其他补充
+
+### 问题 56：你希望 ReActExecutor V1 优先支持哪些真实任务例子？
+
+请写 5-10 条你真实会用的用户输入，例如：
+
+```text
+计算 2+3*4
+读取 README.md 并总结
+搜索 FastAPI 测试方案并总结
+读取 report.md，提取重点后写入 summary.md
+运行单元测试并总结失败原因
+```
+
+你的回答：反正基本的代码编辑修改，项目开发（分步骤分对话用户分步骤询给任务）然后正常调用那5个基础工具可以正常的进行方案步骤执行和调整就行了，至于真实任务例子这个也不好说，因为有点多了，大致就是上面说的这个方向
+
+
+### 问题 57：你有没有特别不希望 ReActExecutor 自动做的事情？
+
+例子：
+
+```text
+不要自动删除文件
+不要自动执行危险命令
+不要修改工作区外文件
+不要自动安装依赖
+不要一次性改太多项目文件
+```
+
+你的回答：例子里面是基本的，一个步骤确实不要改太多文件，可以分布进行修改新增编辑
+
+
+
+
+
+我希望的我的agent和用户的交互类似下面这样的（codex例子）：
+我会重新按“能否指导后续编码、测试和跨轮续接”的标准复核这两份文档；这轮先审查，不改代码，必要时我会指出需要补强的地方并直接修订文档。
+
+Ran commands
+
+Context automatically compacted
+
+我先重新读这两份文档本身，不只按之前的记忆判断。重点会核对：是否和前两层接口一致、是否有自相矛盾、是否能直接指导后续按步骤开发和测试。
+
+Ran commands
+
+刚才 PowerShell 按默认编码读出来是乱码，我会改用 UTF-8 重新读取；另外 rg 在当前环境被拒绝执行，我改用 PowerShell 自带搜索核对接口字段。
+
+Ran commands
+
+两份文档整体方向是对的，但我已经看到几个会在编码时造成歧义的点：Action 枚举别名、thought_visible 是否暴露推理、命令权限策略命名，以及旧 Executor 的最终替换边界。下面我会对照现有代码接口再确认是否需要直接补到文档里。
+
+Ran commands
+
+我会直接把这些容易误解的地方补进两份文档。这样后续开发时不会靠口头记忆，比如 retry 和 retry_step 到底谁是正式值、事件里的 thought_visible 到底能不能展示内部推理。
+
+
+Edited ReActExecutor层设计决策汇总.md+33-9
+
+
+设计汇总我已经补了一轮，主要是把“模型可输出什么”收紧成可实现的协议。现在继续同步开发步骤文档，避免两份文档对枚举和命令策略说法不一致。
+
+
+Ran Select-String -Path 'H:\project\agentProject\src\agent\ReActExecutor层设计决策汇总.md','H:\project\agentProject\src\agent\ReActExecutor层开发步骤与进度.md' -Encoding UTF8 -Pattern 'retry\b|stop_success|stop_failed|fail|thought_visible|once|low_risk_auto|command_confirmation_policy'
+
+
+我发现设计文档里还有一处旧动作名 stop_failed 残留；开发步骤里同类残留更多。这个如果不统一，后面写 schema、dispatcher、测试时会出现同一个动作三种名字的问题。
+
+Ran commands
+
+补丁第一次没有完全匹配到文档上下文，我已经定位到具体段落了，接下来按小块补，降低误改风险。
+
+Edited files
+
+旧 Executor 的边界已经写清楚：它是开发期保护，不是最终架构的一部分。继续统一 ActionType 和 ActionPacket 的字段约束。
+
+Edited ReActExecutor层开发步骤与进度.md+12-3
+
+这里我需要再做一次格式核对：刚才把 ActionType 从总枚举块里拆出来了，必须确保 Markdown 代码块没有断裂，否则后续读文档会混乱。
+
+Ran Get-Content -Encoding UTF8 -LiteralPath 'H:\project\agentProject\src\agent\ReActExecutor层开发步骤与进度.md' | Select-Object -Skip 365 -First 55
+
+确实有一个 Markdown 代码块断开了，我马上修正这个格式问题。
+
+Edited ReActExecutor层开发步骤与进度.md+1-0
+
+格式已经修好。现在继续补 ActionPacket 的“按动作类型必填字段”，这个是后续能不能稳定消费模型输出的关键。
+
+Edited ReActExecutor层开发步骤与进度.md+17-2
+
+ActionPacket 的字段约束已经进入开发步骤文档。接下来处理剩下几个旧名称和事件说明残留。
+
+Edited ReActExecutor层开发步骤与进度.md+9-5
+
+主要补丁已经完成。我现在做一次全文搜索，确认只剩下应该保留的兼容别名，不再有会误导实现的旧动作名。
+
+Ran commands
+
+搜索结果符合预期：stop_success/stop_failed 现在只作为兼容别名出现。命令策略段落我再整理成更顺的两句话，避免“但危险...”和说明紧贴在一起。
+
+Edited ReActExecutor层开发步骤与进度.md+3-2
+
+文档一致性修正完成。我现在看一次 diff，确认改动只限于澄清文档，没有碰代码实现。
+
+Ran commands
+
+这两份 ReActExecutor 文档目前在 git 里还是未跟踪文件，所以普通 git diff 不显示它们的内容差异；这不影响文件实际修改。我会直接按关键段落再读一遍确认。
+
+Ran commands
+
+我重新核查了这两份文档，并已做了必要的文档修正：
+[ReActExecutor层设计决策汇总.md](H:/project/agentProject/src/agent/ReActExecutor层设计决策汇总.md)
+[ReActExecutor层开发步骤与进度.md](H:/project/agentProject/src/agent/ReActExecutor层开发步骤与进度.md)
+结论：这两份文档现在可以作为 ReActExecutor 层开发基线。整体架构、Planner 配合方式、ActionPacket、Observation、Checker、ToolRegistry、安全策略、事件流和测试路线都没有发现根本性设计错误。
+我补充/修正了几个关键点：
+统一了 ActionType
+规范值使用：retry_step、finish、fail
+旧值只作为兼容别名：retry -> retry_step、stop_success -> finish、stop_failed -> fail
+dispatcher 内部只处理归一化后的规范值。
+
+补充了 ActionPacket 按动作类型的必填字段要求
+比如 call_tool 必须有已注册工具名和符合 ToolSpec 的参数。
+finish 必须有 final_answer。
+request_replan 必须有 request_replan_reason。
+
+明确了 thought_visible
+它不是隐藏思维链。
+只能展示整理后的用户可见进度说明，不能展示完整推理、prompt、敏感参数或调试堆栈。
+
+明确了命令确认策略
+ask 等价于之前讨论的 once。
+low_risk_auto/session/always 不能绕过危险命令的 block 或强确认。
+
+明确旧 Executor 的边界
+旧 Executor 只是开发期兼容和回归保护。
+最终目标仍是 ReActExecutor 替换主执行链路。
+
+我没有运行测试，因为这次只修改了设计/进度文档，没有改 Python 实现代码。下一步可以从开发文档里的 Step 0：现状核对与入口策略 和 Step 1：ReActExecutor 配置 开始。
