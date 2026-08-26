@@ -1,7 +1,7 @@
 # Runtime 层开发步骤与进度（3）- 恢复健康验收
 
 > 覆盖步骤：Step 12-18  
-> 当前状态：Step 12-18 待开发  
+> 当前状态：Step 12-14 已完成；Step 15-18 待开发
 > 前置分卷：`Runtime层开发步骤与进度(1)-契约装配.md`、`Runtime层开发步骤与进度(2)-运行主链路.md`  
 > 上位设计：`Runtime事件流与确认恢复设计.md`、`Runtime错误降级与健康检查设计.md`、`Runtime依赖装配与生命周期设计.md`、`Runtime运行流程与Memory集成设计.md`
 
@@ -11,7 +11,7 @@
 
 ## Step 12：resume 确认恢复
 
-**状态：待开发**
+**状态：已完成（2026-08-25）**
 
 ### 目标
 
@@ -109,13 +109,62 @@ python -m pytest tests/test_react_executor_confirmation.py tests/test_react_exec
 
 ### 完成后回写
 
-记录 resume 实际调用底层接口、上下文保存方式、测试结果和已知限制。
+## Step 12 Completion Record (2026-08-25)
+
+```text
+Status: completed
+Updated:
+  - src/app/runtime/core.py
+  - src/agent/orchestrator/react_agent.py
+  - src/agent/react_executor/react_executor.py
+  - tests/app/runtime/test_runtime_resume.py
+  - tests/app/runtime/test_runtime_core_validation.py
+Implemented:
+  - Runtime.resume validates session/run ownership, confirmation_id, and
+    preview_hash before attempting recovery.
+  - Runtime uses PendingRunRegistry.pop() to atomically claim and clear the
+    process-local pending record.
+  - The pending record keeps the real ReActExecutionContext together with the
+    Runtime request context; the executor context is never serialized into a
+    RuntimeResult, public registry snapshot, or normal timeline.
+  - Recovery calls the real
+    ReActExecutor.resume_after_confirmation(context, approved, reason,
+    confirmation_id, preview_hash) interface.
+  - The original event stream and RuntimeEventCoordinator are reused so
+    resumed events continue in the same Memory timeline with deduplication and
+    sequence continuity.
+  - approved, rejected, waiting_user, and error paths all use the existing
+    RuntimeResult and OutputFeedback closeout rules. A waiting result is
+    registered again with its new process-local pending context.
+  - Missing or unavailable pending context returns run_not_found or
+    interrupted and never fabricates a resumed execution.
+  - RuntimeResult metadata marks successful recovery with resumed=True.
+Constraints and deviations:
+  - V1 supports same-process resume only.
+  - Runtime does not rebuild ReActExecutionContext from SQLite and does not
+    start CLI/API, FastAPI/WebSocket, real Providers, or execute tools directly.
+  - confirmation_rejected follows the existing cross-layer mapping and is
+    exposed as cancelled in the final RuntimeResult.
+Verification:
+  - python -m pytest tests/app/runtime/test_runtime_resume.py -q
+    6 passed
+  - python -m pytest tests/app/runtime -q
+    107 passed
+  - python -m pytest tests/test_react_executor_confirmation.py tests/test_react_executor_preview_resume.py -q
+    13 passed
+  - python -m pytest tests/test_react_agent_with_react_executor.py tests/test_react_executor_events.py tests/test_output_feedback_processor.py -q
+    35 passed
+  - python -m compileall -q src/app/runtime src/agent/orchestrator tests/app/runtime
+    passed
+Next:
+  - Step 13 cancel waiting confirmation.
+```
 
 ---
 
 ## Step 13：cancel 等待确认的 run
 
-**状态：待开发**
+**状态：已完成（2026-08-25）**
 
 ### 目标
 
@@ -190,13 +239,55 @@ waiting_user run 可取消。
 
 ### 完成后回写
 
-记录取消边界、底层调用方式、测试结果和后续异步取消预留。
+## Step 13 Completion Record (2026-08-25)
+
+```text
+Status: completed
+Updated:
+  - src/app/runtime/core.py
+  - tests/app/runtime/test_runtime_cancel.py
+  - tests/app/runtime/test_runtime_core_validation.py
+No changes required:
+  - src/app/runtime/pending_runs.py already provides the atomic pop used by
+    both resume and cancel.
+  - src/app/runtime/errors.py already maps cancelled and
+    confirmation_rejected to the stable cancelled error code/status boundary.
+Implemented:
+  - Runtime.cancel validates the request and atomically claims/removes only
+    a process-local pending waiting_user run.
+  - Runtime reuses the real
+    ReActExecutor.resume_after_confirmation(..., approved=False) rejection
+    path, passing the registered confirmation_id and preview_hash.
+  - Runtime emits a visible, sanitized system_notice cancellation event and
+    lets the existing event coordinator and Memory adapter persist it.
+  - Cancellation closes the existing Memory turn with status=cancelled and
+    error_code=cancelled, without re-registering pending confirmation state.
+  - Missing/non-waiting runs return run_not_found and are never force-killed.
+  - Repeated resume after cancellation returns run_not_found because the
+    pending registry entry has already been removed.
+Constraints and deferred work:
+  - V1 does not kill threads, child processes, model calls, or active tools.
+  - V1 does not delete session history.
+  - Future asynchronous cancellation would require an explicit executor/tool
+    cancellation protocol and is outside this Step.
+Verification:
+  - python -m pytest tests/app/runtime/test_runtime_cancel.py -q
+    3 passed
+  - python -m pytest tests/app/runtime -q
+    110 passed
+  - python -m pytest tests/test_react_executor_confirmation.py tests/test_react_executor_preview_resume.py -q
+    13 passed
+  - python -m compileall -q src/app/runtime tests/app/runtime
+    passed
+Next:
+  - Step 14 Runtime health checks.
+```
 
 ---
 
 ## Step 14：Runtime health 检查
 
-**状态：待开发**
+**状态：已完成（2026-08-25）**
 
 ### 目标
 
@@ -284,7 +375,59 @@ health 不泄露敏感配置。
 
 ### 完成后回写
 
-记录健康检查项、聚合规则、真实依赖能力和测试结果。
+## Step 14 Completion Record (2026-08-25)
+
+```text
+Status: completed
+Added:
+  - src/app/runtime/health.py
+  - tests/app/runtime/test_runtime_health.py
+Updated:
+  - src/app/runtime/core.py
+  - src/app/runtime/factory.py
+  - src/app/runtime/__init__.py
+Implemented:
+  - HealthCheck and RuntimeHealthReport public-safe data models.
+  - Runtime.health() aggregation for runtime_initialized, memory, database,
+    models, tools, react_agent, and workspace.
+  - Memory health uses RuntimeMemoryAdapter.health() and preserves the
+    persistence degraded boundary without direct SQL access.
+  - Models health uses the existing ModelManager.health_check() config-level
+    interface and never calls verify_provider_config() or a real model request.
+  - Tools health inspects registry/runtime configuration only; it never
+    executes a tool or performs shell/MCP probing.
+  - ReactAgent health verifies formal Runtime mode and manage_memory=False.
+  - Workspace health performs bounded Path existence/type inspection.
+  - Health exceptions are converted to unavailable checks with only safe
+    error types; sensitive configuration and paths are not exposed.
+  - Closed Runtime instances report unavailable without calling dependencies.
+  - RuntimeFactory supplies HealthChecker by default while retaining explicit
+    health_checker injection for tests.
+  - Runtime.close() remains idempotent and does not delete Memory history.
+Aggregation:
+  - Any unavailable core check makes the overall status unavailable.
+  - Otherwise any degraded check makes the overall status degraded.
+  - Otherwise the overall status is healthy.
+Verification:
+  - python -m pytest tests/app/runtime/test_runtime_health.py -q
+    5 passed
+  - python -m pytest tests/app/runtime -q
+    115 passed
+  - python -m pytest tests/test_models_health_verify.py tests/test_memory_runtime_adapter.py tests/test_react_executor_confirmation.py tests/test_react_executor_preview_resume.py -q
+    23 passed
+  - python -m compileall -q src/app/runtime tests/app/runtime
+    passed
+  - git diff --check
+    passed
+Boundaries and deferred work:
+  - No API /health route was added in this Step.
+  - No real provider live verification, shell command probe, tool execution,
+    MCP connection, or database repair is performed by health().
+  - Health is an in-process snapshot; it does not replace operational
+    monitoring or asynchronous dependency recovery.
+Next:
+  - Step 15 session/list/timeline/delete/export Runtime facade.
+```
 
 ---
 
@@ -656,4 +799,3 @@ python -m pytest tests/test_output_feedback_processor.py -q
 ### 完成后回写
 
 记录 Runtime V1 最终状态、测试总览、交接给 CLI/API 的接口清单和下一阶段建议。
-

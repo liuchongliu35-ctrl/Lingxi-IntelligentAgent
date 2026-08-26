@@ -238,6 +238,7 @@ class ResumeRequest(_ContractMixin):
     reason: str = ""
     confirmation_id: str | None = None
     preview_hash: str | None = None
+    debug: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -250,6 +251,7 @@ class ResumeRequest(_ContractMixin):
             "confirmation_id",
         )
         self.preview_hash = _normalize_optional_text(self.preview_hash, "preview_hash")
+        self.debug = _normalize_bool(self.debug, "debug")
         self.metadata = _normalize_mapping(self.metadata, "metadata")
 
 

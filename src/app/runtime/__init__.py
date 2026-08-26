@@ -44,6 +44,7 @@ from .pending_runs import (
     PendingRunRegistry,
 )
 from .events import RuntimeEventCoordinator
+from .health import HEALTH_STATUSES, HealthCheck, HealthChecker, RuntimeHealthReport
 from .core import Runtime
 from .factory import RuntimeConfig, RuntimeFactory, build_for_test, build_production
 
@@ -67,6 +68,10 @@ __all__ = [
     "PendingRunRecord",
     "PendingRunRegistry",
     "RuntimeEventCoordinator",
+    "HEALTH_STATUSES",
+    "HealthCheck",
+    "HealthChecker",
+    "RuntimeHealthReport",
     "build_for_test",
     "build_production",
     "SENSITIVE_FIELD_NAMES",

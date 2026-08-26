@@ -26,6 +26,7 @@ from src.tools.tool_manager import ToolManager
 
 from .core import Runtime
 from .errors import RuntimeErrorCode, RuntimeException
+from .health import HealthChecker
 from .pending_runs import (
     DEFAULT_PENDING_RUN_TTL_SECONDS,
     PendingRunRegistry,
@@ -316,7 +317,7 @@ class RuntimeFactory:
             react_agent=react_agent,
             output_feedback_processor=output_feedback_processor,
             pending_run_registry=pending_run_registry,
-            health_checker=overrides.get("health_checker"),
+            health_checker=overrides.get("health_checker") or HealthChecker(),
             recover_on_startup=config.recover_on_startup,
         )
 

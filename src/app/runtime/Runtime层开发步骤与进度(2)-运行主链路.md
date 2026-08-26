@@ -1,7 +1,7 @@
 # Runtime 层开发步骤与进度（2）- 运行主链路
 
-> 覆盖步骤：Step 6-11  
-> 当前状态：Step 6-10 已完成，Step 11 待开发  
+> 覆盖步骤：Step 6-11
+> 当前状态：Step 6-11 已完成
 > 前置分卷：`Runtime层开发步骤与进度(1)-契约装配.md`  
 > 上位设计：`Runtime架构与模块设计.md`、`Runtime运行流程与Memory集成设计.md`、`Runtime事件流与确认恢复设计.md`、`Runtime公共契约与数据模型设计.md`
 
@@ -789,7 +789,7 @@ timeline 返回。
 
 ## Step 11：Runtime 普通 run 主链路集成测试
 
-**状态：待开发**
+**状态：已完成（2026-08-25）**
 
 ### 目标
 
@@ -865,3 +865,55 @@ RuntimeResult 可被 CLI/API 后续直接消费。
 ### 完成后回写
 
 记录集成测试结果、发现的跨层偏差、是否需要修改设计或其他层。
+
+### Step 11 完成记录（2026-08-25）
+
+```text
+状态：已完成
+
+新增：
+  - tests/app/runtime/test_runtime_run.py
+  - tests/app/runtime/test_runtime_run_integration.py
+
+实现与验收：
+  - 使用最小 fake Memory adapter、fake ReactAgent 和
+    OutputFeedbackProcessor 夹具，验证普通 run 的核心调用顺序：
+    begin_turn -> react_agent_kwargs -> ReactAgent.run_with_result ->
+    event callback/Memory record_event -> OutputFeedback.build ->
+    Memory.complete_turn。
+  - 验证 Runtime 向 ReactAgent 传递 context_text、session_id、run_id、
+    event_callback、event_callback_visible_only=True 和
+    manage_memory=False。
+  - 验证 Agent 未写入 user/assistant 消息，assistant message 只由
+    Memory complete_turn 产生。
+  - 使用真实 SessionManager、RuntimeMemoryAdapter 和临时 SQLite 验证：
+    无 session_id 创建新 session、指定 session_id 复用多轮会话、
+    Memory context 进入第二轮 Agent、run 状态完成、assistant 消息不重复。
+  - 验证可见 ExecutionEvent 进入 Memory timeline，内部事件不进入普通
+    timeline，RuntimeResult 保留 execution_result、output_feedback、
+    memory_result、timeline 以及 session/run 标识。
+  - 测试未调用真实模型、Provider、Tools、CLI、FastAPI 或 WebSocket。
+
+测试：
+  - python -m pytest tests/app/runtime/test_runtime_run.py
+      tests/app/runtime/test_runtime_run_integration.py -q
+    结果：4 passed
+  - python -m pytest tests/app/runtime -q
+    结果：101 passed
+  - python -m pytest tests/test_memory_runtime_adapter.py
+      tests/test_memory_v1_end_to_end_acceptance.py
+      tests/test_memory_react_agent_adaptation.py -q
+    结果：19 passed
+  - python -m compileall -q src/app/runtime tests/app/runtime
+    结果：passed
+
+偏差：
+  - 未发现需要修改 Memory、Agent、Models 或 Tools 公开契约的跨层偏差。
+  - Step 10 已记录 waiting_user 当前由 PendingRunRegistry 表达，
+    RuntimeMemoryAdapter 尚无独立 wait_turn()；本 Step 未扩大该范围。
+
+遗留：
+  - Step 12 进入 resume 确认恢复，继续使用同一进程级
+    PendingRunRegistry 和 Runtime 正式模式。
+  - CLI/API、真实流式输出和跨进程恢复仍按后续步骤开发。
+```

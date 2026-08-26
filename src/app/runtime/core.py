@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -34,6 +34,7 @@ from .serialization import (
     serialize_runtime_event,
 )
 from .events import RuntimeEventCoordinator
+from .health import HealthChecker
 
 
 MAX_RUNTIME_INPUT_CHARS = 32_000
@@ -59,6 +60,14 @@ class _RuntimeRequestContext:
     event_coordinator: RuntimeEventCoordinator = field(
         default_factory=RuntimeEventCoordinator
     )
+
+
+@dataclass(frozen=True)
+class _RuntimePendingContext:
+    """Process-local state required to resume one waiting Runtime turn."""
+
+    executor_context: Any
+    runtime_context: _RuntimeRequestContext
 
 
 class Runtime:
@@ -181,28 +190,401 @@ class Runtime:
         return self._execution_not_available_result(context)
 
     def resume(self, request: ResumeRequest) -> RuntimeResult:
-        """Validate the future same-process confirmation recovery request."""
+        """Resume a same-process run that is waiting for confirmation."""
 
         try:
             self._validate_resume_request(request)
         except RuntimeException as exc:
             return runtime_result_from_exception(exc)
-        return self._operation_not_available_result(
-            session_id=request.session_id,
-            run_id=request.run_id,
+
+        pop = getattr(self.pending_run_registry, "pop", None)
+        if not callable(pop):
+            return runtime_result_from_exception(
+                RuntimeException(
+                    RuntimeErrorCode.DEPENDENCY_INIT_FAILED,
+                    "Runtime pending-run registry does not provide pop.",
+                    metadata={"dependency": "pending_run_registry"},
+                ),
+                session_id=request.session_id,
+                run_id=request.run_id,
+            )
+
+        try:
+            pending_record = pop(
+                request.run_id,
+                session_id=request.session_id,
+            )
+        except RuntimeException as exc:
+            return runtime_result_from_exception(
+                exc,
+                session_id=request.session_id,
+                run_id=request.run_id,
+            )
+        except Exception as exc:
+            return runtime_result_from_exception(
+                RuntimeException(
+                    RuntimeErrorCode.INTERNAL_ERROR,
+                    "Runtime could not access the pending run registry.",
+                    metadata={"stage": "resume_registry"},
+                    cause=exc,
+                ),
+                session_id=request.session_id,
+                run_id=request.run_id,
+            )
+
+        if pending_record is None:
+            return runtime_result_from_exception(
+                RuntimeException(
+                    RuntimeErrorCode.RUN_NOT_FOUND,
+                    "The pending Runtime run was not found or has expired.",
+                ),
+                session_id=request.session_id,
+                run_id=request.run_id,
+            )
+
+        pending_context = getattr(pending_record, "executor_context", None)
+        if not isinstance(pending_context, _RuntimePendingContext):
+            return runtime_result_from_exception(
+                RuntimeException(
+                    RuntimeErrorCode.INTERRUPTED,
+                    "The pending execution context is no longer available for resume.",
+                ),
+                session_id=request.session_id,
+                run_id=request.run_id,
+            )
+
+        executor_context = pending_context.executor_context
+        context = pending_context.runtime_context
+        if executor_context is None:
+            return runtime_result_from_exception(
+                RuntimeException(
+                    RuntimeErrorCode.INTERRUPTED,
+                    "The pending execution context is no longer available for resume.",
+                ),
+                session_id=request.session_id,
+                run_id=request.run_id,
+            )
+
+        if (
+            self._context_session_id(context) != request.session_id
+            or self._context_run_id(context) != request.run_id
+        ):
+            return runtime_result_from_exception(
+                RuntimeException(
+                    RuntimeErrorCode.SESSION_CONFLICT,
+                    "The pending execution context does not match the requested run.",
+                ),
+                session_id=request.session_id,
+                run_id=request.run_id,
+            )
+
+        # A resume request may choose a different debug view, but it keeps the
+        # original Memory turn, event sink, and coordinator instance intact.
+        if context.request.debug != request.debug:
+            context = replace(
+                context,
+                request=replace(context.request, debug=request.debug),
+            )
+
+        # Runtime performs the safe boundary check first. The underlying
+        # executor receives the same values as well and performs its own
+        # authoritative confirmation/preview validation before any tool call.
+        confirmation_mismatch = self._pending_confirmation_mismatch(
+            pending_record,
+            request,
         )
 
+        event_stream = getattr(executor_context, "event_stream", None)
+        unsubscribe = None
+        if event_stream is not None:
+            subscribe = getattr(event_stream, "subscribe", None)
+            if callable(subscribe):
+                try:
+                    unsubscribe = subscribe(
+                        self._build_run_event_callback(context),
+                        visible_only=True,
+                    )
+                except Exception as exc:
+                    return self._runtime_result_from_error(
+                        context,
+                        RuntimeException(
+                            RuntimeErrorCode.AGENT_EXECUTION_FAILED,
+                            "Runtime could not subscribe to resume events.",
+                            metadata={"stage": "resume_event_subscription"},
+                            cause=exc,
+                        ),
+                    )
+
+        try:
+            resume_after_confirmation = getattr(
+                self.react_executor,
+                "resume_after_confirmation",
+                None,
+            )
+            if not callable(resume_after_confirmation):
+                raise RuntimeException(
+                    RuntimeErrorCode.DEPENDENCY_INIT_FAILED,
+                    "Runtime ReActExecutor does not provide resume_after_confirmation.",
+                    metadata={"dependency": "react_executor"},
+                )
+
+            execution_result = resume_after_confirmation(
+                executor_context,
+                approved=request.approved,
+                reason=(
+                    confirmation_mismatch
+                    if confirmation_mismatch
+                    else request.reason
+                ),
+                confirmation_id=request.confirmation_id,
+                preview_hash=request.preview_hash,
+            )
+            if self._runtime_status_from_execution(execution_result) == "waiting_user":
+                # Re-registering a second confirmation needs the same live
+                # executor context, while keeping it out of public results.
+                execution_result.executor_context = executor_context
+            self._replay_unprocessed_result_events(context, execution_result)
+
+            build_feedback = getattr(self.output_feedback_processor, "build", None)
+            if not callable(build_feedback):
+                raise RuntimeException(
+                    RuntimeErrorCode.DEPENDENCY_INIT_FAILED,
+                    "Runtime OutputFeedbackProcessor does not provide build.",
+                    metadata={"dependency": "output_feedback_processor"},
+                )
+            output_feedback = build_feedback(
+                execution_result,
+                include_internal=False,
+                group_related=True,
+            )
+        except RuntimeException as exc:
+            return self._runtime_result_from_error(context, exc)
+        except Exception as exc:
+            return self._runtime_result_from_error(
+                context,
+                RuntimeException(
+                    RuntimeErrorCode.AGENT_EXECUTION_FAILED,
+                    "Runtime confirmation recovery failed.",
+                    metadata={"stage": "resume_execution"},
+                    cause=exc,
+                ),
+            )
+        finally:
+            if callable(unsubscribe):
+                try:
+                    unsubscribe()
+                except Exception:
+                    pass
+
+        result = self._runtime_result_from_agent(
+            context,
+            execution_result,
+            output_feedback,
+        )
+        result.metadata = {
+            **result.metadata,
+            "resumed": True,
+        }
+        return result
+
     def cancel(self, request: CancelRequest) -> RuntimeResult:
-        """Validate the future pending-run cancellation request."""
+        """Cancel a same-process run that is waiting for confirmation."""
 
         try:
             self._validate_cancel_request(request)
         except RuntimeException as exc:
             return runtime_result_from_exception(exc)
-        return self._operation_not_available_result(
-            session_id=request.session_id,
-            run_id=request.run_id,
+
+        pop = getattr(self.pending_run_registry, "pop", None)
+        if not callable(pop):
+            return runtime_result_from_exception(
+                RuntimeException(
+                    RuntimeErrorCode.DEPENDENCY_INIT_FAILED,
+                    "Runtime pending-run registry does not provide pop.",
+                    metadata={"dependency": "pending_run_registry"},
+                ),
+                session_id=request.session_id,
+                run_id=request.run_id,
+            )
+
+        try:
+            pending_record = pop(
+                request.run_id,
+                session_id=request.session_id,
+            )
+        except RuntimeException as exc:
+            return runtime_result_from_exception(
+                exc,
+                session_id=request.session_id,
+                run_id=request.run_id,
+            )
+        except Exception as exc:
+            return runtime_result_from_exception(
+                RuntimeException(
+                    RuntimeErrorCode.INTERNAL_ERROR,
+                    "Runtime could not access the pending run registry.",
+                    metadata={"stage": "cancel_registry"},
+                    cause=exc,
+                ),
+                session_id=request.session_id,
+                run_id=request.run_id,
+            )
+
+        if pending_record is None:
+            return runtime_result_from_exception(
+                RuntimeException(
+                    RuntimeErrorCode.RUN_NOT_FOUND,
+                    "Only a waiting_user pending run can be cancelled; no pending run was found.",
+                ),
+                session_id=request.session_id,
+                run_id=request.run_id,
+            )
+
+        pending_context = getattr(pending_record, "executor_context", None)
+        if not isinstance(pending_context, _RuntimePendingContext):
+            return runtime_result_from_exception(
+                RuntimeException(
+                    RuntimeErrorCode.INTERRUPTED,
+                    "The pending execution context is no longer available for cancellation.",
+                ),
+                session_id=request.session_id,
+                run_id=request.run_id,
+            )
+
+        executor_context = pending_context.executor_context
+        context = pending_context.runtime_context
+        if executor_context is None:
+            return runtime_result_from_exception(
+                RuntimeException(
+                    RuntimeErrorCode.INTERRUPTED,
+                    "The pending execution context is no longer available for cancellation.",
+                ),
+                session_id=request.session_id,
+                run_id=request.run_id,
+            )
+
+        if (
+            self._context_session_id(context) != request.session_id
+            or self._context_run_id(context) != request.run_id
+        ):
+            return runtime_result_from_exception(
+                RuntimeException(
+                    RuntimeErrorCode.SESSION_CONFLICT,
+                    "The pending execution context does not match the requested run.",
+                ),
+                session_id=request.session_id,
+                run_id=request.run_id,
+            )
+
+        event_stream = getattr(executor_context, "event_stream", None)
+        unsubscribe = None
+        if event_stream is not None:
+            subscribe = getattr(event_stream, "subscribe", None)
+            if callable(subscribe):
+                try:
+                    unsubscribe = subscribe(
+                        self._build_run_event_callback(context),
+                        visible_only=True,
+                    )
+                except Exception as exc:
+                    return self._runtime_result_from_error(
+                        context,
+                        RuntimeException(
+                            RuntimeErrorCode.AGENT_EXECUTION_FAILED,
+                            "Runtime could not subscribe to cancellation events.",
+                            metadata={"stage": "cancel_event_subscription"},
+                            cause=exc,
+                        ),
+                    )
+
+        cancel_reason = sanitize_error_message(
+            request.reason or "User cancelled the pending confirmation."
         )
+        pending_confirmation = getattr(pending_record, "pending_confirmation", None)
+        confirmation_id = None
+        preview_hash = None
+        if isinstance(pending_confirmation, Mapping):
+            confirmation_id = pending_confirmation.get("confirmation_id")
+            preview_hash = pending_confirmation.get("preview_hash")
+
+        try:
+            emit_event = getattr(event_stream, "emit_event", None)
+            if callable(emit_event):
+                emit_event(
+                    "system_notice",
+                    cancel_reason,
+                    payload={"status": "cancelled", "reason": cancel_reason},
+                    visible_to_user=True,
+                )
+
+            cancel_confirmation = getattr(
+                self.react_executor,
+                "resume_after_confirmation",
+                None,
+            )
+            if not callable(cancel_confirmation):
+                raise RuntimeException(
+                    RuntimeErrorCode.DEPENDENCY_INIT_FAILED,
+                    "Runtime ReActExecutor does not provide confirmation cancellation.",
+                    metadata={"dependency": "react_executor"},
+                )
+
+            execution_result = cancel_confirmation(
+                executor_context,
+                approved=False,
+                reason=cancel_reason,
+                confirmation_id=confirmation_id,
+                preview_hash=preview_hash,
+            )
+            self._replay_unprocessed_result_events(context, execution_result)
+
+            build_feedback = getattr(self.output_feedback_processor, "build", None)
+            if not callable(build_feedback):
+                raise RuntimeException(
+                    RuntimeErrorCode.DEPENDENCY_INIT_FAILED,
+                    "Runtime OutputFeedbackProcessor does not provide build.",
+                    metadata={"dependency": "output_feedback_processor"},
+                )
+            output_feedback = build_feedback(
+                execution_result,
+                include_internal=False,
+                group_related=True,
+            )
+        except RuntimeException as exc:
+            return self._runtime_result_from_error(context, exc)
+        except Exception as exc:
+            return self._runtime_result_from_error(
+                context,
+                RuntimeException(
+                    RuntimeErrorCode.AGENT_EXECUTION_FAILED,
+                    "Runtime confirmation cancellation failed.",
+                    metadata={"stage": "cancel_execution"},
+                    cause=exc,
+                ),
+            )
+        finally:
+            if callable(unsubscribe):
+                try:
+                    unsubscribe()
+                except Exception:
+                    pass
+
+        result = self._runtime_result_from_agent(
+            context,
+            execution_result,
+            output_feedback,
+            terminal_error=RuntimeException(
+                RuntimeErrorCode.CANCELLED,
+                cancel_reason,
+                status="cancelled",
+                metadata={"stage": "runtime_cancel"},
+            ),
+        )
+        result.metadata = {
+            **result.metadata,
+            "cancelled": True,
+        }
+        return result
 
     def get_session(self, session_id: str) -> Any:
         """Validate the future session lookup entrypoint."""
@@ -240,9 +622,34 @@ class Runtime:
         return self._operation_not_available()
 
     def health(self) -> dict[str, Any]:
-        """Reserve the health facade for the dedicated health-check step."""
+        """Return an aggregated, sanitized health report for Runtime."""
 
-        return self._operation_not_available()
+        checker = self.health_checker or HealthChecker()
+        check = getattr(checker, "check", None)
+        if not callable(check):
+            return HealthChecker().failure(
+                self,
+                RuntimeError("health checker does not provide check()"),
+            ).to_dict()
+        try:
+            report = check(self)
+            if hasattr(report, "to_dict"):
+                report = report.to_dict()
+            if not isinstance(report, dict):
+                raise TypeError("health checker returned a non-mapping result")
+            serialized = safe_serialize(
+                report,
+                debug=False,
+                max_depth=8,
+                max_items=100,
+                max_text_chars=500,
+            )
+            return serialized if isinstance(serialized, dict) else HealthChecker().failure(
+                self,
+                RuntimeError("health report serialization failed"),
+            ).to_dict()
+        except Exception as exc:
+            return HealthChecker().failure(self, exc).to_dict()
 
     def close(self) -> None:
         """Close releasable dependencies once, without deleting Memory data."""
@@ -611,6 +1018,7 @@ class Runtime:
         context: _RuntimeRequestContext,
         execution_result: Any,
         output_feedback: Any,
+        terminal_error: RuntimeException | None = None,
     ) -> RuntimeResult:
         status = self._runtime_status_from_execution(execution_result)
         feedback_output = getattr(output_feedback, "final_output", None)
@@ -669,6 +1077,22 @@ class Runtime:
             "request_replan": request_replan,
             "replan_reason": replan_reason,
         }
+
+        if terminal_error is not None:
+            common["requires_user_input"] = False
+            common["pending_confirmation"] = None
+            memory_result = self._fail_memory_turn(context, terminal_error)
+            return self._runtime_result_with_memory(
+                context,
+                RuntimeResult(
+                    success=False,
+                    status=terminal_error.status,
+                    error_code=terminal_error.code,
+                    error_message=terminal_error.message,
+                    **common,
+                ),
+                memory_result,
+            )
 
         if status == "waiting_user":
             self._register_pending_run(
@@ -959,8 +1383,7 @@ class Runtime:
         context: _RuntimeRequestContext,
         execution_result: Any,
     ) -> Any:
-        # ReActExecutor V1 keeps its live context local to execute(). Test or
-        # future adapters may expose the minimal resume context explicitly.
+        actual_context = None
         for owner in (
             execution_result,
             self.react_agent,
@@ -975,8 +1398,36 @@ class Runtime:
             ):
                 candidate = getattr(owner, field_name, None)
                 if candidate is not None:
-                    return candidate
-        return context
+                    actual_context = candidate
+                    break
+            if actual_context is not None:
+                break
+        return _RuntimePendingContext(
+            executor_context=actual_context,
+            runtime_context=context,
+        )
+
+    def _pending_confirmation_mismatch(
+        self,
+        pending_record: Any,
+        request: ResumeRequest,
+    ) -> str | None:
+        pending = getattr(pending_record, "pending_confirmation", None)
+        if not isinstance(pending, Mapping):
+            return None
+        for field_name, label in (
+            ("confirmation_id", "confirmation_id"),
+            ("preview_hash", "preview_hash"),
+        ):
+            expected = pending.get(field_name)
+            supplied = getattr(request, field_name, None)
+            if (
+                expected is not None
+                and supplied is not None
+                and str(expected) != str(supplied)
+            ):
+                return f"The supplied {label} does not match the pending confirmation."
+        return None
 
     def _mark_finalization_persistence_failure(self, turn: Any, error: Any) -> None:
         try:

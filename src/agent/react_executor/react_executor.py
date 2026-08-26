@@ -314,6 +314,11 @@ class ReActExecutor:
                 result = self._empty_plan_result(context)
             else:
                 result = self._execute_react_loop(context)
+            if result.status == "waiting_user":
+                # Runtime confirmation recovery needs this live, process-local
+                # context. It is intentionally an internal dynamic attribute:
+                # public result serialization uses an explicit field allowlist.
+                result.executor_context = context
             return result
         except Exception as exc:
             self.execution_logger.log_execution_exception(context, exc)

@@ -432,7 +432,7 @@ class ReactAgent:
             status = "completed" if success else "failed"
 
         output = str(getattr(execution, "output", "") or "")
-        return ReactExecutionResult(
+        result = ReactExecutionResult(
             execution_id=str(getattr(execution, "execution_id", "") or new_id("agent_execution")),
             plan_id=str(getattr(execution, "plan_id", "") or getattr(plan, "plan_id", "")),
             source_trace_id=getattr(execution, "source_trace_id", None)
@@ -453,6 +453,12 @@ class ReactAgent:
             request_replan=bool(getattr(execution, "request_replan", False)),
             replan_reason=getattr(execution, "replan_reason", None),
         )
+        executor_context = getattr(execution, "executor_context", None)
+        if executor_context is not None:
+            # Runtime uses this only for same-process confirmation recovery;
+            # structured result serialization has an explicit public allowlist.
+            result.executor_context = executor_context
+        return result
 
     def _event_is_visible(self, event: Any) -> bool:
         if isinstance(event, dict):

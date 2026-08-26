@@ -1,8 +1,8 @@
 # Runtime 层开发步骤与进度
 
 > 文档性质：Runtime V1 开发总入口  
-> 当前日期：2026-08-24  
-> 当前阶段：Runtime V1 开发中（Step 0-8 已完成）  
+> 当前日期：2026-08-25
+> 当前阶段：Runtime V1 开发中（Step 0-13 已完成）
 > 上位设计：`Runtime架构与模块设计.md`、`Runtime公共契约与数据模型设计.md`、`Runtime依赖装配与生命周期设计.md`、`Runtime运行流程与Memory集成设计.md`、`Runtime事件流与确认恢复设计.md`、`Runtime错误降级与健康检查设计.md`
 
 本文档只记录 Runtime V1 的开发路线、分卷入口、步骤状态、依赖关系和跨 Session 更新规则，不替代 Runtime 设计文档。开发时如果步骤文档与设计文档存在冲突，必须先停止实现、核对两轮问答和 Runtime 设计文档，再同步修正文档；不得由开发者临时改变架构边界。
@@ -68,16 +68,15 @@ Runtime factory / dependency lifecycle 已完成
 Runtime core facade 已完成
 Runtime 与 Memory begin_turn / session/run / context 接入已完成
 Runtime 与 ReactAgent 正式模式及 OutputFeedback 接入已完成
+Runtime resume / cancel 确认恢复与取消已完成
 ```
 
 ### 2.2 待开发
 
 ```text
-  Runtime 事件回调包装与转发
-  Runtime 与 Memory complete/fail/waiting/replan 收口
-  Runtime resume / cancel
   Runtime health
   Runtime session/list/timeline/delete/export facade
+  Runtime 启动恢复、close 与依赖失败降级
   Runtime 单元测试、跨层集成测试和回归测试
 ```
 
@@ -112,8 +111,8 @@ Models:
 | 分卷 | 步骤 | 内容 | 当前状态 |
 |---|---:|---|---|
 | [契约装配](Runtime层开发步骤与进度(1)-契约装配.md) | Step 0-5 | 基线、contracts、serialization、errors、pending registry、factory 生命周期 | 已完成 |
-| [运行主链路](Runtime层开发步骤与进度(2)-运行主链路.md) | Step 6-11 | Runtime core、Memory begin、ReactAgent 调用、事件流、结果收口、主链路测试 | Step 6-10 已完成，Step 11 待开发 |
-| [恢复健康验收](Runtime层开发步骤与进度(3)-恢复健康验收.md) | Step 12-18 | resume/cancel、health、session facade、export、启动恢复、跨层验收 | 待开发 |
+| [运行主链路](Runtime层开发步骤与进度(2)-运行主链路.md) | Step 6-11 | Runtime core、Memory begin、ReactAgent 调用、事件流、结果收口、主链路测试 | Step 6-11 已完成 |
+| [恢复健康验收](Runtime层开发步骤与进度(3)-恢复健康验收.md) | Step 12-18 | resume/cancel、health、session facade、export、启动恢复、跨层验收 | Step 12-13 已完成 |
 
 总体依赖：
 
@@ -199,10 +198,35 @@ Runtime V1 开发周期内禁止：
 ## 6. 当前进度
 
 ```text
-当前分卷：Runtime层开发步骤与进度(2)-运行主链路.md
-当前 Step：Step 10
+当前分卷：Runtime层开发步骤与进度(3)-恢复健康验收.md
+当前 Step：Step 14
 当前状态：已完成（2026-08-25）
-下一步：进入 Step 11，完成 Runtime 普通 run 主链路集成验收；继续保持 manage_memory=False，且不绕过 Memory/Tools/Models 的公开接口。
+下一步：进入 Step 15，实现 session/list/timeline/delete/export Runtime facade；继续保持 manage_memory=False，且不绕过 Memory/Tools/Models 的公开接口。
+```
+
+## Step 14 Completion Record (2026-08-25)
+
+```text
+Status: completed
+Updated:
+  - src/app/runtime/health.py
+  - src/app/runtime/core.py
+  - src/app/runtime/factory.py
+  - src/app/runtime/__init__.py
+  - tests/app/runtime/test_runtime_health.py
+Implemented:
+  - Added sanitized Runtime health aggregation for all seven required checks.
+  - Reused Memory.health() and Models.health_check() without direct SQL,
+    provider calls, tool execution, shell probing, or MCP connection probing.
+  - Added closed-runtime unavailable behavior and preserved idempotent close.
+Verification:
+  - Step 14 tests: 5 passed.
+  - Runtime regression: 115 passed.
+  - Memory/Models/Executor regression: 23 passed.
+  - compileall: passed.
+  - git diff --check: passed.
+Next:
+  - Step 15 session/list/timeline/delete/export Runtime facade.
 ```
 
 ---
@@ -345,4 +369,43 @@ Known migration note:
     existing constant import surface during the package migration.
 Next:
   - Step 6 Runtime main execution chain.
+```
+
+## Step 11 Completion Record (2026-08-25)
+
+```text
+Status: completed
+Added:
+  - tests/app/runtime/test_runtime_run.py
+  - tests/app/runtime/test_runtime_run_integration.py
+Implemented:
+  - Added fake-dependency coverage for the ordinary Runtime run order:
+    Memory begin_turn, ReactAgent formal invocation, event callback,
+    OutputFeedback construction, and Memory complete_turn.
+  - Verified context_text, session_id, run_id, event callback settings, and
+    manage_memory=False are passed to ReactAgent.
+  - Verified ReactAgent does not write user/assistant messages and that the
+    Memory-owned completion path writes the assistant message once.
+  - Added a temporary SQLite integration path covering new-session creation,
+    multi-turn session reuse, context propagation, completed run state, and
+    visible versus internal event timeline behavior.
+  - Verified RuntimeResult keeps the stable session/run, output,
+    execution_result, output_feedback, memory_result, and timeline fields.
+  - No real Provider, model, tool, CLI, FastAPI, or WebSocket was started.
+Verification:
+  - python -m pytest tests/app/runtime/test_runtime_run.py tests/app/runtime/test_runtime_run_integration.py -q
+    4 passed
+  - python -m pytest tests/app/runtime -q
+    101 passed
+  - python -m pytest tests/test_memory_runtime_adapter.py tests/test_memory_v1_end_to_end_acceptance.py tests/test_memory_react_agent_adaptation.py -q
+    19 passed
+  - python -m compileall -q src/app/runtime tests/app/runtime
+    passed
+Cross-layer deviation:
+  - No Memory, Agent, Models, or Tools public-contract change was required.
+  - The Step 10 waiting_user deviation remains: RuntimeMemoryAdapter has no
+    separate wait_turn() API, so PendingRunRegistry continues to express the
+    process-local waiting state.
+Next:
+  - Step 14 Runtime health checks.
 ```

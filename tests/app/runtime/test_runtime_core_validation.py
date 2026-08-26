@@ -130,10 +130,10 @@ def test_public_facade_methods_and_stable_parameter_names_exist(tmp_path: Path) 
             run_id="run_20260824_120000_demo001",
             approved=True,
         )
-    ).error_code == "internal_error"
+    ).error_code == "dependency_init_failed"
     assert runtime.cancel(
         CancelRequest(
             session_id="session_20260824_120000_demo001",
             run_id="run_20260824_120000_demo001",
         )
-    ).error_code == "internal_error"
+    ).error_code == "dependency_init_failed"
