@@ -152,8 +152,15 @@ class RuntimeFactory:
                 model_name=overrides.get("model_name"),
             )
             return cls._build_runtime(config, overrides)
-        except RuntimeException:
-            raise
+        except RuntimeException as exc:
+            if exc.code == RuntimeErrorCode.DEPENDENCY_INIT_FAILED.value:
+                raise
+            raise RuntimeException(
+                RuntimeErrorCode.DEPENDENCY_INIT_FAILED,
+                "Runtime dependency initialization failed.",
+                metadata={"stage": "factory"},
+                cause=exc,
+            ) from exc
         except Exception as exc:
             raise RuntimeException(
                 RuntimeErrorCode.DEPENDENCY_INIT_FAILED,

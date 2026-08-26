@@ -1,7 +1,7 @@
 # Runtime 层开发步骤与进度（2）- 运行主链路
 
 > 覆盖步骤：Step 6-11
-> 当前状态：Step 6-11 已完成
+> 当前状态：Step 6-11 已完成，Runtime V1 已收尾
 > 前置分卷：`Runtime层开发步骤与进度(1)-契约装配.md`  
 > 上位设计：`Runtime架构与模块设计.md`、`Runtime运行流程与Memory集成设计.md`、`Runtime事件流与确认恢复设计.md`、`Runtime公共契约与数据模型设计.md`
 
@@ -917,3 +917,11 @@ RuntimeResult 可被 CLI/API 后续直接消费。
     PendingRunRegistry 和 Runtime 正式模式。
   - CLI/API、真实流式输出和跨进程恢复仍按后续步骤开发。
 ```
+
+## Runtime V1 Closeout
+
+Runtime V1 的运行主链路卷已完成。后续 CLI/API 只应基于当前 Runtime 的稳定契约继续开发，不应回退修改 Step 6-11 的已完成边界。
+
+交接说明：
+
+- [Runtime V1交接说明.md](<./Runtime V1交接说明.md>)

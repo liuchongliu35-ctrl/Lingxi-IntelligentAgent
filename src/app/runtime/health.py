@@ -179,11 +179,15 @@ class HealthChecker:
                 message="Runtime is initialized with resource close warnings.",
                 metadata={"close_error_count": close_errors},
             )
+        recovery_count = getattr(runtime, "recovery_count", None)
+        metadata = {"formal_runtime_mode": True}
+        if isinstance(recovery_count, int) and not isinstance(recovery_count, bool):
+            metadata["recovered_interrupted_run_count"] = recovery_count
         return HealthCheck(
             name="runtime_initialized",
             status="healthy",
             message="Runtime dependencies are initialized.",
-            metadata={"formal_runtime_mode": True},
+            metadata=metadata,
         )
 
     def _memory(self, runtime: Any) -> tuple[HealthCheck, Any | None]:

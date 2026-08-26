@@ -1,8 +1,8 @@
 # Runtime 层开发步骤与进度
 
 > 文档性质：Runtime V1 开发总入口  
-> 当前日期：2026-08-25
-> 当前阶段：Runtime V1 开发中（Step 0-13 已完成）
+> 当前日期：2026-08-26
+> 当前阶段：Runtime V1 已完成（Step 0-18）
 > 上位设计：`Runtime架构与模块设计.md`、`Runtime公共契约与数据模型设计.md`、`Runtime依赖装配与生命周期设计.md`、`Runtime运行流程与Memory集成设计.md`、`Runtime事件流与确认恢复设计.md`、`Runtime错误降级与健康检查设计.md`
 
 本文档只记录 Runtime V1 的开发路线、分卷入口、步骤状态、依赖关系和跨 Session 更新规则，不替代 Runtime 设计文档。开发时如果步骤文档与设计文档存在冲突，必须先停止实现、核对两轮问答和 Runtime 设计文档，再同步修正文档；不得由开发者临时改变架构边界。
@@ -69,15 +69,15 @@ Runtime core facade 已完成
 Runtime 与 Memory begin_turn / session/run / context 接入已完成
 Runtime 与 ReactAgent 正式模式及 OutputFeedback 接入已完成
 Runtime resume / cancel 确认恢复与取消已完成
+Runtime health 检查已完成
+Runtime session/list/timeline/delete/export facade 已完成
+Runtime 启动恢复、close 与依赖失败降级已完成
 ```
 
 ### 2.2 待开发
 
 ```text
-  Runtime health
-  Runtime session/list/timeline/delete/export facade
-  Runtime 启动恢复、close 与依赖失败降级
-  Runtime 单元测试、跨层集成测试和回归测试
+  Runtime V1 收尾、文档回写与 CLI/API 交接
 ```
 
 ### 2.3 迁移期处理口径
@@ -112,7 +112,7 @@ Models:
 |---|---:|---|---|
 | [契约装配](Runtime层开发步骤与进度(1)-契约装配.md) | Step 0-5 | 基线、contracts、serialization、errors、pending registry、factory 生命周期 | 已完成 |
 | [运行主链路](Runtime层开发步骤与进度(2)-运行主链路.md) | Step 6-11 | Runtime core、Memory begin、ReactAgent 调用、事件流、结果收口、主链路测试 | Step 6-11 已完成 |
-| [恢复健康验收](Runtime层开发步骤与进度(3)-恢复健康验收.md) | Step 12-18 | resume/cancel、health、session facade、export、启动恢复、跨层验收 | Step 12-13 已完成 |
+| [恢复健康验收](Runtime层开发步骤与进度(3)-恢复健康验收.md) | Step 12-18 | resume/cancel、health、session facade、export、启动恢复、跨层验收 | Step 12-17 已完成 |
 
 总体依赖：
 
@@ -199,9 +199,9 @@ Runtime V1 开发周期内禁止：
 
 ```text
 当前分卷：Runtime层开发步骤与进度(3)-恢复健康验收.md
-当前 Step：Step 14
-当前状态：已完成（2026-08-25）
-下一步：进入 Step 15，实现 session/list/timeline/delete/export Runtime facade；继续保持 manage_memory=False，且不绕过 Memory/Tools/Models 的公开接口。
+当前 Step：Step 18
+当前状态：已完成（2026-08-26）
+下一步：Runtime V1 已收尾；CLI/API 从 [Runtime V1交接说明.md](<./Runtime V1交接说明.md>) 进入。
 ```
 
 ## Step 14 Completion Record (2026-08-25)
@@ -227,6 +227,137 @@ Verification:
   - git diff --check: passed.
 Next:
   - Step 15 session/list/timeline/delete/export Runtime facade.
+```
+
+## Step 15 Completion Record (2026-08-26)
+
+```text
+Status: completed
+Updated:
+  - src/app/runtime/core.py
+  - src/app/runtime/export.py
+  - src/app/runtime/pending_runs.py
+  - tests/app/runtime/test_runtime_sessions.py
+  - tests/app/runtime/test_runtime_export.py
+Implemented:
+  - Added safe Runtime session lookup (including visible-message filtering),
+    session listing, visible timeline lookup, V1 hard deletion, and Markdown
+    export facades.
+  - All data access goes through RuntimeMemoryAdapter or SessionManager
+    public methods; Runtime does not access SQLite, SQL, or repo.
+  - Runtime re-serializes public session/timeline values through safe_serialize
+    and preserves Memory's visibility and sanitization boundary.
+  - Markdown contains session basics, user/assistant messages, and visible
+    execution-event text only. Sensitive/internal fields are omitted.
+  - Export paths are workspace-contained and existing files are rejected.
+  - Deleted sessions also clear matching process-local pending confirmation
+    records through PendingRunRegistry.clear_session().
+Verification:
+  - Step 15 tests: 6 passed.
+  - Runtime regression: 121 passed.
+  - Memory session/storage regression: 12 passed.
+  - Memory RuntimeAdapter/end-to-end/adaptation regression: 19 passed.
+  - compileall: passed.
+  - git diff --check was blocked by the existing Git LFS clean filter on
+    logs/analyzer.log; source/test files were otherwise checked by compile
+    and pytest.
+Scope:
+  - No CLI/API implementation, soft delete, direct repository access,
+    overwrite option, or cross-process resume was added.
+Next:
+  - Step 16 startup recovery, close, and dependency-failure degradation.
+```
+
+## Step 16 Completion Record (2026-08-26)
+
+```text
+Status: completed
+Added:
+  - tests/app/runtime/test_runtime_lifecycle.py
+Updated:
+  - src/app/runtime/core.py
+  - src/app/runtime/factory.py
+  - src/app/runtime/health.py
+  - src/app/runtime/Runtime层开发步骤与进度(3)-恢复健康验收.md
+Implemented:
+  - Startup recovery uses only SessionManager.recover_interrupted_runs().
+  - Health exposes the safely bounded recovered interrupted-run count.
+  - close remains idempotent and preserves SQLite session history.
+  - Factory/startup failure boundaries consistently return
+    dependency_init_failed; existing Memory and Agent Runtime mappings remain
+    memory_unavailable/persistence_warning and agent_execution_failed.
+Verification:
+  - Lifecycle tests: 7 passed.
+  - Runtime regression: 128 passed.
+  - Memory recovery/session-manager regression: 10 passed.
+  - compileall: passed.
+Scope:
+  - No cross-process resume, automatic interrupted-run continuation, API
+    lifespan, direct SQL access, or close-time session deletion.
+Next:
+  - Step 17 Runtime cross-layer integration regression.
+```
+
+## Step 17 Completion Record (2026-08-26)
+
+```text
+Status: completed
+Added:
+  - tests/app/runtime/test_runtime_cross_layer_acceptance.py
+Implemented:
+  - Added real Memory-backed cross-layer acceptance coverage for ordinary
+    runs, session reuse, event visibility/deduplication, waiting confirmation,
+    resume, cancel, policy blocking, replanning, persistence warnings, and
+    health aggregation.
+  - Verified Runtime formal mode keeps manage_memory=False and does not
+    duplicate Memory-owned messages.
+  - Verified no production changes were needed in Memory, Agent, Models, or
+    Tools.
+Verification:
+  - Cross-layer acceptance: 8 passed.
+  - Runtime regression: 136 passed.
+  - Memory regression: 19 passed.
+  - Agent/ReActExecutor/OutputFeedback regression: 44 passed.
+  - compileall: passed.
+Known boundary:
+  - waiting_user persistence remains represented by the process-local pending
+    registry; the underlying AgentRun stays running until resume/cancel.
+Next:
+  - Step 18 Runtime V1 closeout, documentation, and CLI/API handoff.
+```
+
+## Step 18 Completion Record (2026-08-26)
+
+```text
+Status: completed
+Added:
+  - src/app/runtime/Runtime V1交接说明.md
+Updated:
+  - src/app/runtime/Runtime层开发步骤与进度.md
+  - src/app/runtime/Runtime层开发步骤与进度(1)-契约装配.md
+  - src/app/runtime/Runtime层开发步骤与进度(2)-运行主链路.md
+  - src/app/runtime/Runtime层开发步骤与进度(3)-恢复健康验收.md
+  - src/app/runtime/Runtime架构与模块设计.md
+  - src/app/runtime/Runtime公共契约与数据模型设计.md
+  - src/app/runtime/Runtime依赖装配与生命周期设计.md
+  - src/app/runtime/Runtime运行流程与Memory集成设计.md
+  - src/app/runtime/Runtime事件流与确认恢复设计.md
+  - src/app/runtime/Runtime错误降级与健康检查设计.md
+Implemented / confirmed:
+  - Runtime V1 design coverage is complete across contracts, lifecycle,
+    run flow, event flow, recovery, health, and public facade boundaries.
+  - CLI/API handoff now points to the stable Runtime contracts and the V1
+    handoff doc instead of duplicating Runtime logic.
+  - run_stream remains a reserved V1 entrypoint, not an operational
+    streaming transport.
+Verification:
+  - Final accepted code verification remains the Step 17 regression set:
+    Runtime 136 passed, Memory 19 passed, Agent/ReActExecutor/OutputFeedback
+    44 passed, cross-layer acceptance 8 passed, compileall passed.
+Scope note:
+  - Step 18 is documentation and handoff only; no Runtime behavior changed.
+Next:
+  - CLI/API implementation should begin from the Runtime V1 handoff doc.
 ```
 
 ---

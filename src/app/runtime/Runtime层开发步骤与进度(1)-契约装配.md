@@ -1,7 +1,7 @@
 # Runtime 层开发步骤与进度（1）- 契约装配
 
 > 覆盖步骤：Step 0-5  
-> 当前状态：Step 0 已完成，Step 1-5 待开发  
+> 当前状态：Step 0-5 已完成，Runtime V1 已收尾
 > 上位设计：`Runtime架构与模块设计.md`、`Runtime公共契约与数据模型设计.md`、`Runtime依赖装配与生命周期设计.md`、`Runtime错误降级与健康检查设计.md`
 
 本分卷先建立 Runtime V1 的基础契约、错误、序列化、pending registry 和依赖装配。没有完成本分卷前，不应开始正式 Runtime 主链路开发。
@@ -1036,6 +1036,14 @@ Known limitations:
 Next:
   - Step 6 Runtime main execution chain.
 ```
+
+## Runtime V1 Closeout
+
+Runtime V1 的契约装配卷已完成。后续 CLI/API 只应以当前 Runtime 公开契约为准，不再回头改写 Step 0-5 的设计边界。
+
+交接说明：
+
+- [Runtime V1交接说明.md](<./Runtime V1交接说明.md>)
 
 ## Step 5 Completion Record (2026-08-24)
 

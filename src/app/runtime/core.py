@@ -34,6 +34,7 @@ from .serialization import (
     serialize_runtime_event,
 )
 from .events import RuntimeEventCoordinator
+from .export import build_session_markdown
 from .health import HealthChecker
 
 
@@ -587,39 +588,233 @@ class Runtime:
         return result
 
     def get_session(self, session_id: str) -> Any:
-        """Validate the future session lookup entrypoint."""
+        """Return a safe serialized Memory session projection."""
 
-        self._validate_session_id(session_id)
-        return self._operation_not_available()
+        normalized_session_id = self._validate_session_id(session_id)
+        get_session = getattr(self.memory_adapter, "get_session", None)
+        if not callable(get_session):
+            raise RuntimeException(
+                RuntimeErrorCode.DEPENDENCY_INIT_FAILED,
+                "Runtime Memory adapter does not provide get_session.",
+                metadata={"dependency": "memory_adapter"},
+            )
+        try:
+            session = get_session(normalized_session_id)
+        except KeyError as exc:
+            raise RuntimeException(
+                RuntimeErrorCode.SESSION_NOT_FOUND,
+                "The requested session was not found.",
+                metadata={"operation": "get_session"},
+                cause=exc,
+            ) from exc
+        except RuntimeException:
+            raise
+        except Exception as exc:
+            raise self._session_facade_error(
+                exc,
+                operation="get_session",
+            ) from exc
+        return self._safe_session_projection(session)
 
     def list_sessions(self) -> list[Any]:
-        """Reserve the future session-list facade without touching Memory."""
+        """Return safe serialized session summaries from SessionManager."""
 
-        return self._operation_not_available()
+        list_sessions = getattr(self.session_manager, "list_sessions", None)
+        if not callable(list_sessions):
+            raise RuntimeException(
+                RuntimeErrorCode.DEPENDENCY_INIT_FAILED,
+                "Runtime SessionManager does not provide list_sessions.",
+                metadata={"dependency": "session_manager"},
+            )
+        try:
+            sessions = list_sessions()
+        except RuntimeException:
+            raise
+        except Exception as exc:
+            raise self._session_facade_error(
+                exc,
+                operation="list_sessions",
+            ) from exc
+        serialized = safe_serialize(sessions or [], debug=False)
+        return serialized if isinstance(serialized, list) else []
 
     def get_timeline(self, session_id: str) -> list[Any]:
-        """Validate the future timeline lookup entrypoint."""
+        """Return the Memory-owned, visible-only timeline projection."""
 
-        self._validate_session_id(session_id)
-        return self._operation_not_available()
+        normalized_session_id = self._validate_session_id(session_id)
+        get_timeline = getattr(self.memory_adapter, "get_timeline", None)
+        if not callable(get_timeline):
+            raise RuntimeException(
+                RuntimeErrorCode.DEPENDENCY_INIT_FAILED,
+                "Runtime Memory adapter does not provide get_timeline.",
+                metadata={"dependency": "memory_adapter"},
+            )
+        try:
+            timeline = get_timeline(normalized_session_id)
+        except KeyError as exc:
+            raise RuntimeException(
+                RuntimeErrorCode.SESSION_NOT_FOUND,
+                "The requested session was not found.",
+                metadata={"operation": "get_timeline"},
+                cause=exc,
+            ) from exc
+        except RuntimeException:
+            raise
+        except Exception as exc:
+            raise self._session_facade_error(
+                exc,
+                operation="get_timeline",
+            ) from exc
+        serialized = safe_serialize(timeline or [], debug=False)
+        if not isinstance(serialized, list):
+            return []
+        return [
+            item
+            for item in serialized
+            if isinstance(item, dict) and item.get("visible_to_user", True) is not False
+        ]
 
     def delete_session(self, session_id: str) -> bool:
-        """Validate the future session deletion entrypoint."""
+        """Hard-delete a session through SessionManager's public interface."""
 
-        self._validate_session_id(session_id)
-        return self._operation_not_available()
+        normalized_session_id = self._validate_session_id(session_id)
+        delete_session = getattr(self.session_manager, "delete_session", None)
+        if not callable(delete_session):
+            raise RuntimeException(
+                RuntimeErrorCode.DEPENDENCY_INIT_FAILED,
+                "Runtime SessionManager does not provide delete_session.",
+                metadata={"dependency": "session_manager"},
+            )
+        try:
+            deleted = delete_session(normalized_session_id)
+        except RuntimeException:
+            raise
+        except Exception as exc:
+            raise self._session_facade_error(
+                exc,
+                operation="delete_session",
+            ) from exc
+        if not isinstance(deleted, bool):
+            raise RuntimeException(
+                RuntimeErrorCode.INTERNAL_ERROR,
+                "Runtime session deletion returned an invalid result.",
+                metadata={"operation": "delete_session"},
+            )
+        if not deleted:
+            raise RuntimeException(
+                RuntimeErrorCode.SESSION_NOT_FOUND,
+                "The requested session was not found.",
+                metadata={"operation": "delete_session"},
+            )
+        clear_session = getattr(self.pending_run_registry, "clear_session", None)
+        if callable(clear_session):
+            try:
+                clear_session(normalized_session_id)
+            except Exception:
+                # Session deletion is already complete; stale process-local
+                # confirmation state must not turn a successful delete into a
+                # different public result.
+                pass
+        return True
 
     def export_session(
         self,
         session_id: str,
         output_path: str | Path | None = None,
     ) -> Any:
-        """Validate the future session export entrypoint."""
+        """Return Markdown and optionally write it to a safe new file."""
 
-        self._validate_session_id(session_id)
+        normalized_session_id = self._validate_session_id(session_id)
         if output_path is not None and not isinstance(output_path, (str, Path)):
             raise self._validation_error("output_path must be a path string or Path")
-        return self._operation_not_available()
+        session = self.get_session(normalized_session_id)
+        timeline = self.get_timeline(normalized_session_id)
+        content = build_session_markdown(session, timeline)
+
+        if output_path is None:
+            return content
+
+        destination = self._safe_export_path(output_path)
+        try:
+            with destination.open("x", encoding="utf-8", newline="\n") as stream:
+                stream.write(content)
+        except FileExistsError as exc:
+            raise RuntimeException(
+                RuntimeErrorCode.EXPORT_FAILED,
+                "The export destination already exists.",
+                metadata={"operation": "export_session", "reason": "file_exists"},
+                cause=exc,
+            ) from exc
+        except (OSError, ValueError) as exc:
+            raise RuntimeException(
+                RuntimeErrorCode.EXPORT_FAILED,
+                "Runtime could not write the session export.",
+                metadata={"operation": "export_session"},
+                cause=exc,
+            ) from exc
+        return content
+
+    def _session_facade_error(
+        self,
+        error: Exception,
+        *,
+        operation: str,
+    ) -> RuntimeException:
+        mapped = map_exception(
+            error,
+            default_code=RuntimeErrorCode.MEMORY_UNAVAILABLE,
+            metadata={"operation": operation},
+        )
+        if mapped.code in {
+            RuntimeErrorCode.SESSION_NOT_FOUND.value,
+            RuntimeErrorCode.SESSION_CONFLICT.value,
+        }:
+            return mapped
+        return RuntimeException(
+            RuntimeErrorCode.MEMORY_UNAVAILABLE,
+            "Runtime could not access session data.",
+            metadata={"operation": operation},
+            cause=error,
+        )
+
+    def _safe_session_projection(self, session: Any) -> dict[str, Any]:
+        serialized = safe_serialize(session, debug=False)
+        if not isinstance(serialized, dict):
+            return {}
+        messages = serialized.get("messages")
+        if isinstance(messages, list):
+            serialized["messages"] = [
+                message
+                for message in messages
+                if isinstance(message, dict)
+                and message.get("visible_to_user", True) is not False
+            ]
+        return serialized
+
+    def _safe_export_path(self, output_path: str | Path) -> Path:
+        raw_path = Path(output_path).expanduser()
+        if not raw_path.is_absolute():
+            destination = self.workspace_root / raw_path
+        else:
+            destination = raw_path
+        try:
+            resolved = destination.resolve()
+            workspace = self.workspace_root.resolve()
+            resolved.relative_to(workspace)
+        except (OSError, ValueError) as exc:
+            raise RuntimeException(
+                RuntimeErrorCode.EXPORT_FAILED,
+                "Export destination must be inside the Runtime workspace.",
+                metadata={"operation": "export_session", "reason": "path_policy"},
+                cause=exc,
+            ) from exc
+        if resolved == workspace:
+            raise RuntimeException(
+                RuntimeErrorCode.EXPORT_FAILED,
+                "Export destination must be a file inside the Runtime workspace.",
+                metadata={"operation": "export_session", "reason": "path_policy"},
+            )
+        return resolved
 
     def health(self) -> dict[str, Any]:
         """Return an aggregated, sanitized health report for Runtime."""
@@ -1617,13 +1812,26 @@ class Runtime:
             )
         try:
             count = recover()
-        except RuntimeException:
-            raise
+        except RuntimeException as exc:
+            if exc.code == RuntimeErrorCode.DEPENDENCY_INIT_FAILED.value:
+                raise
+            raise RuntimeException(
+                RuntimeErrorCode.DEPENDENCY_INIT_FAILED,
+                "Runtime startup recovery failed.",
+                metadata={
+                    "dependency": "session_manager",
+                    "stage": "startup_recovery",
+                },
+                cause=exc,
+            ) from exc
         except Exception as exc:
             raise RuntimeException(
                 RuntimeErrorCode.DEPENDENCY_INIT_FAILED,
                 "Runtime startup recovery failed.",
-                metadata={"dependency": "session_manager"},
+                metadata={
+                    "dependency": "session_manager",
+                    "stage": "startup_recovery",
+                },
                 cause=exc,
             ) from exc
         if isinstance(count, bool):

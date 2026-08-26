@@ -1,7 +1,7 @@
 # Runtime 层开发步骤与进度（3）- 恢复健康验收
 
 > 覆盖步骤：Step 12-18  
-> 当前状态：Step 12-14 已完成；Step 15-18 待开发
+> 当前状态：Step 12-18 已完成，Runtime V1 已收尾
 > 前置分卷：`Runtime层开发步骤与进度(1)-契约装配.md`、`Runtime层开发步骤与进度(2)-运行主链路.md`  
 > 上位设计：`Runtime事件流与确认恢复设计.md`、`Runtime错误降级与健康检查设计.md`、`Runtime依赖装配与生命周期设计.md`、`Runtime运行流程与Memory集成设计.md`
 
@@ -433,7 +433,7 @@ Next:
 
 ## Step 15：session/list/timeline/delete/export Runtime facade
 
-**状态：待开发**
+**状态：已完成（2026-08-26）**
 
 ### 目标
 
@@ -529,11 +529,82 @@ python -m pytest tests/test_memory_session_manager.py tests/test_memory_storage.
 
 记录 facade 调用方式、导出格式、删除边界和测试结果。
 
+## Step 15 Completion Record (2026-08-26)
+
+```text
+Status: completed
+Added:
+  - src/app/runtime/export.py
+  - tests/app/runtime/test_runtime_sessions.py
+  - tests/app/runtime/test_runtime_export.py
+Updated:
+  - src/app/runtime/core.py
+  - src/app/runtime/pending_runs.py
+Implemented:
+  - Runtime.get_session() delegates to RuntimeMemoryAdapter.get_session()
+    and returns a safe serialized SessionState projection containing only
+    user-visible messages.
+  - Runtime.list_sessions() delegates to SessionManager.list_sessions()
+    and returns safe serialized SessionInfo projections.
+  - Runtime.get_timeline() delegates to RuntimeMemoryAdapter.get_timeline().
+    Memory remains responsible for mapping, visibility filtering, ordering,
+    and event payload sanitization; Runtime applies the public serialization
+    boundary again before returning.
+  - Runtime.delete_session() performs V1 hard deletion through
+    SessionManager.delete_session(), maps missing sessions to
+    session_not_found, and clears process-local pending records for the
+    deleted session when the registry provides clear_session().
+  - Runtime.export_session() builds user-facing Markdown from the safe
+    session/timeline projections. The document contains session basics,
+    conversation messages, and visible execution-event type/time/content.
+  - Export never emits timeline metadata, event payloads, hidden reasoning,
+    raw prompts, raw tool results, or credential fields.
+  - Relative export paths are resolved under workspace_root; absolute paths
+    outside the workspace are rejected. Existing files are never overwritten;
+    exclusive file creation maps collisions and write failures to
+    export_failed. output_path=None returns Markdown without writing.
+  - PendingRunRegistry.clear_session() removes deleted-session confirmation
+    contexts without adding persistence or cross-process recovery.
+Error boundary:
+  - Missing sessions -> RuntimeErrorCode.SESSION_NOT_FOUND.
+  - Session data access failures -> memory_unavailable unless an existing
+    RuntimeException already carries a stable session/conflict code.
+  - Export path and write failures -> export_failed.
+Constraints and deviations:
+  - No direct SQLite/SQL or repository access was added to Runtime.
+  - No soft delete/archive, CLI command, API route, overwrite flag, or
+    cross-process pending-run recovery was added.
+  - Markdown export returns content for CLI/API adapters and optionally
+    writes a new workspace-contained file; it does not expose raw Memory
+    objects.
+Verification:
+  - python -m pytest tests/app/runtime/test_runtime_sessions.py
+    tests/app/runtime/test_runtime_export.py -q
+    6 passed
+  - python -m pytest tests/app/runtime -q
+    121 passed
+  - python -m pytest tests/test_memory_session_manager.py
+    tests/test_memory_storage.py -q
+    12 passed
+  - python -m pytest tests/test_memory_runtime_adapter.py
+    tests/test_memory_v1_end_to_end_acceptance.py
+    tests/test_memory_react_agent_adaptation.py -q
+    19 passed
+  - python -m compileall -q src/app/runtime tests/app/runtime
+    passed
+  - git diff --check
+    blocked by the repository's existing Git LFS clean filter while
+    processing logs/analyzer.log; no formatting error was reported for the
+    Step 15 source or test files.
+Next:
+  - Step 16 startup recovery, close, and dependency-failure degradation.
+```
+
 ---
 
 ## Step 16：启动恢复、close 与依赖失败降级
 
-**状态：待开发**
+**状态：已完成（2026-08-26）**
 
 ### 目标
 
@@ -618,11 +689,61 @@ python -m pytest tests/test_memory_logging_recovery.py tests/test_memory_session
 
 记录恢复数量、close 释放资源列表、失败映射和测试结果。
 
+## Step 16 Completion Record (2026-08-26)
+
+```text
+Status: completed
+Added:
+  - tests/app/runtime/test_runtime_lifecycle.py
+Updated:
+  - src/app/runtime/core.py
+  - src/app/runtime/factory.py
+  - src/app/runtime/health.py
+Implemented:
+  - Runtime startup recovery remains exclusively delegated to
+    SessionManager.recover_interrupted_runs(); Runtime does not access the
+    Memory repository or SQLite directly.
+  - recovery_count is retained on Runtime and exposed as
+    runtime_initialized.metadata.recovered_interrupted_run_count in the safe
+    health report.
+  - Startup recovery converts any non-dependency Runtime failure to
+    dependency_init_failed with the startup_recovery stage. Factory preserves
+    already-classified dependency_init_failed errors and converts other
+    assembly failures at its boundary.
+  - Runtime.close() remains idempotent, deduplicates dependencies, and tries
+    close/shutdown/stop/dispose for MCP connections, executor, agent, tools,
+    Memory/context, session, model, pending registry, and health dependencies.
+    Close failures are recorded as sanitized Runtime errors.
+  - close() does not call session deletion or any SQLite history deletion API.
+  - Existing Runtime.run() behavior was verified: begin_turn failures map to
+    memory_unavailable; finalization failures retain the Agent result with a
+    persistence warning; unclassified Agent failures map to
+    agent_execution_failed.
+Verification:
+  - python -m pytest tests/app/runtime/test_runtime_lifecycle.py -q
+    7 passed
+  - python -m pytest tests/app/runtime -q
+    128 passed
+  - python -m pytest tests/test_memory_logging_recovery.py
+    tests/test_memory_session_manager.py -q
+    10 passed
+  - python -m compileall -q src/app/runtime tests/app/runtime
+    passed
+Scope and deferred work:
+  - Startup recovery marks pending/running/waiting_user records interrupted;
+    it neither reconstructs executor context nor resumes work automatically.
+  - Pending confirmation recovery remains same-process only.
+  - No API lifespan implementation, session deletion during close, real
+    provider invocation, or direct SQL access was added.
+Next:
+  - Step 17 Runtime cross-layer integration regression.
+```
+
 ---
 
 ## Step 17：Runtime 跨层集成回归
 
-**状态：待开发**
+**状态：已完成（2026-08-26）**
 
 ### 目标
 
@@ -709,11 +830,62 @@ Runtime V1 核心能力不依赖 CLI/API 即可闭环。
 
 记录所有验收场景结果、失败清单、偏差和是否需要修改其他层。
 
+## Step 17 Completion Record (2026-08-26)
+
+```text
+Status: completed
+Added:
+  - tests/app/runtime/test_runtime_cross_layer_acceptance.py
+Implemented and verified:
+  - New-session ordinary conversation through RuntimeMemoryAdapter,
+    SessionManager, SQLite, fake ReactAgent, and OutputFeedbackProcessor.
+  - Multiple turns on one session, including Memory-built context propagation
+    and stable session/run ownership.
+  - Formal Runtime mode with manage_memory=False; Agent did not duplicate
+    user/assistant message writes.
+  - Visible ExecutionEvent persistence, RuntimeEvent wrapping, external event
+    visibility, result-event fallback, deduplication, and hidden-event
+    exclusion from timeline/result output.
+  - waiting_user/pending_confirmation, same-process resume approved and
+    rejected, and cancel cleanup/event recording.
+  - blocked_by_policy and request_replan status/error mapping without an
+    automatic replan loop.
+  - Memory event persistence degradation: output remains available while
+    persistence_available=false and persistence_warning remains sanitized.
+  - Basic Runtime health aggregation across Memory, Models, Tools, ReactAgent,
+    and workspace.
+Verification:
+  - python -m pytest tests/app/runtime/test_runtime_cross_layer_acceptance.py -q
+    8 passed
+  - python -m pytest tests/app/runtime -q
+    136 passed
+  - python -m pytest tests/test_memory_runtime_adapter.py
+    tests/test_memory_v1_end_to_end_acceptance.py
+    tests/test_memory_react_agent_adaptation.py -q
+    19 passed
+  - python -m pytest tests/test_react_agent_with_react_executor.py
+    tests/test_react_executor_events.py
+    tests/test_react_executor_confirmation.py
+    tests/test_output_feedback_processor.py -q
+    44 passed
+  - python -m compileall -q src/app/runtime tests/app/runtime
+    passed
+Cross-layer deviations:
+  - No Memory, Agent, Models, or Tools production-code changes were required.
+  - Runtime V1 still keeps waiting_user state process-local for resume;
+    Memory has no separate wait_turn API, so the persisted AgentRun remains
+    running until resume/cancel finalization.
+  - No CLI/API, FastAPI/WebSocket, real external Provider, or real tool
+    execution was started in this acceptance step.
+Next:
+  - Step 18 Runtime V1 closeout, documentation, and CLI/API handoff.
+```
+
 ---
 
 ## Step 18：Runtime V1 收尾、文档回写与对 CLI/API 交接
 
-**状态：待开发**
+**状态：已完成（2026-08-26）**
 
 ### 目标
 
@@ -799,3 +971,40 @@ python -m pytest tests/test_output_feedback_processor.py -q
 ### 完成后回写
 
 记录 Runtime V1 最终状态、测试总览、交接给 CLI/API 的接口清单和下一阶段建议。
+
+## Step 18 Completion Record (2026-08-26)
+
+```text
+Status: completed
+Added:
+  - src/app/runtime/Runtime V1交接说明.md
+Updated:
+  - src/app/runtime/Runtime层开发步骤与进度.md
+  - src/app/runtime/Runtime层开发步骤与进度(1)-契约装配.md
+  - src/app/runtime/Runtime层开发步骤与进度(2)-运行主链路.md
+  - src/app/runtime/Runtime层开发步骤与进度(3)-恢复健康验收.md
+Implemented / confirmed:
+  - Runtime V1 core design is implemented across contracts, lifecycle,
+    memory integration, event flow, error mapping, health, and cross-layer
+    regression coverage.
+  - Stable public entrypoints and final RuntimeRequest / RuntimeResult /
+    RuntimeEvent contracts are documented for CLI/API consumers.
+  - CLI/API must reuse Runtime, preserve manage_memory=False, and continue to
+    respect Memory/Models/Tools boundaries instead of reimplementing the
+    Agent chain.
+  - Known limits were documented explicitly: no cross-process断点续跑,
+    no forced tool termination, no API auth, no concrete CLI/API entrypoints,
+    and run_stream remains reserved in V1.
+Verification:
+  - Design audit against all six Runtime design docs completed.
+  - Runtime / Memory / Agent / ReActExecutor / OutputFeedback regression
+    results from Step 17 remain the final accepted code verification:
+    Runtime 136 passed, Memory 19 passed, Agent/ReActExecutor/OutputFeedback
+    44 passed, cross-layer acceptance 8 passed, compileall passed.
+Scope note:
+  - This step did not introduce new Runtime behavior; it closed the V1
+    documentation and handoff boundary only.
+Next:
+  - CLI/API steps should start from the Runtime V1 handoff doc and stable
+    contracts above.
+```

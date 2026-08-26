@@ -259,6 +259,21 @@ class PendingRunRegistry:
             self._records.clear()
             return count
 
+    def clear_session(self, session_id: str) -> int:
+        """Remove all pending records belonging to one deleted session."""
+
+        normalized_session_id = validate_session_id(session_id)
+        with self._lock:
+            self._expire_locked(_as_utc(self._clock(), "clock result"))
+            run_ids = [
+                run_id
+                for run_id, record in self._records.items()
+                if record.session_id == normalized_session_id
+            ]
+            for run_id in run_ids:
+                del self._records[run_id]
+            return len(run_ids)
+
     def __len__(self) -> int:
         with self._lock:
             self._expire_locked(_as_utc(self._clock(), "clock result"))
